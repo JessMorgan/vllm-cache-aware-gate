@@ -104,6 +104,12 @@ class GateStats:
             "Seconds since the last successful vLLM /metrics fetch (NaN if never fetched).",
             registry=self._registry,
         )
+        self._remaining = Gauge(
+            "gate_kv_cache_remaining_tokens",
+            "The gate's own live estimate of remaining KV-cache tokens up to the target "
+            "(post-subtraction, pre-reanchor). NaN until anchored.",
+            registry=self._registry,
+        )
 
         # Tracks which model_name label series are currently set, so stale
         # models can be removed when they disappear from the feed.
@@ -115,6 +121,8 @@ class GateStats:
         # fresh=0.0 and age=NaN (not 0.0) before the first set_freshness call.
         self._fresh.set(0.0)
         self._age.set(float("nan"))
+        # A never-anchored remaining-KV counter renders NaN (not 0.0).
+        self._remaining.set(float("nan"))
 
     def record_forwarded(self, endpoint: str, model: str, ctx_tokens: int | None) -> None:
         """Count a forwarded (allowed) request.
@@ -160,6 +168,10 @@ class GateStats:
         """
         self._fresh.set(1.0 if fresh else 0.0)
         self._age.set(age_s if age_s is not None else float("nan"))
+
+    def set_remaining(self, value: int | None) -> None:
+        """Set the estimated-remaining-KV gauge. ``None`` (never anchored) renders NaN."""
+        self._remaining.set(float(value) if value is not None else float("nan"))
 
     def render(self) -> bytes:
         """Render the current metrics in Prometheus exposition format."""
