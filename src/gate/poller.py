@@ -18,8 +18,9 @@ response is likewise non-fatal (``observed`` is ``False`` and all state is
 kept).
 
 **Fail closed (unconditional):** an observed (HTTP 200) body that lacks a
-usable ``vllm:kv_cache_size_tokens`` gauge cannot anchor the counter, so the
-poller logs an error and raises
+usable KV-cache capacity (the ``vllm:kv_cache_size_tokens`` gauge or the
+``kv_cache_size_tokens`` label on ``vllm:cache_config_info``) cannot anchor
+the counter, so the poller logs an error and raises
 :class:`~gate.metrics.CapacityUnavailableError`. There is no mode or flag:
 autoconfig is always on, and the app's fatal callback exits the process.
 
@@ -102,13 +103,18 @@ async def run_poller(
                 if sample.observed:
                     if sample.capacity_tokens is None:
                         log.error(
-                            "autoconfig requires vllm:kv_cache_size_tokens but the "
-                            "observed body at %s does not provide it; the process "
-                            "will exit",
+                            "autoconfig requires a usable KV-cache capacity (the "
+                            "vllm:kv_cache_size_tokens gauge or the "
+                            "kv_cache_size_tokens label on vllm:cache_config_info) "
+                            "but the observed body at %s does not provide it; the "
+                            "process will exit",
                             url,
                         )
                         raise CapacityUnavailableError(
-                            f"observed /metrics body at {url} lacks vllm:kv_cache_size_tokens"
+                            f"observed /metrics body at {url} lacks a usable "
+                            "KV-cache capacity (the vllm:kv_cache_size_tokens gauge "
+                            "or the kv_cache_size_tokens label on "
+                            "vllm:cache_config_info)"
                         )
                     if sample.usage_frac is not None:
                         cache.update(sample.usage_frac)

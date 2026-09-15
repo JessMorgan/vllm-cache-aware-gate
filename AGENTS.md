@@ -62,13 +62,16 @@ FastAPI app wires together.
   `parse_kv_cache_usage_by_model(text) -> dict[str, float] | None` (per-model
   fractions keyed by `model_name`, `"default"` when unlabeled),
   `parse_kv_cache_capacity(text) -> int | None` (max positive
-  `vllm:kv_cache_size_tokens` sample), and `fetch_metrics(client, url) ->
+  `vllm:kv_cache_size_tokens` gauge sample, falling back to the
+  `kv_cache_size_tokens` label on `vllm:cache_config_info` — the form current
+  vLLM emits), and `fetch_metrics(client, url) ->
   MetricsSample` (a single GET that parses usage + by-model + capacity from one
   body). `MetricsCache` (last value + `fetched_at` + `age()`; `by_model()`
   stores the per-model breakdown while `_value` stays the MAX of it),
   `CapacityCache` (last good capacity token count; never stale, only unknown),
   `CapacityUnavailableError` (raised by the poller on an observed body missing
-  the capacity gauge), and `KvRemaining` — the in-memory estimated-remaining-KV
+  a usable KV-cache capacity — the `vllm:kv_cache_size_tokens` gauge or the
+  `kv_cache_size_tokens` label on `vllm:cache_config_info`), and `KvRemaining` — the in-memory estimated-remaining-KV
   counter (`reanchor(tokens)` resets, `subtract(tokens)` is unclamped and a
   no-op when never anchored, `value()` returns `int | None`).
 - **`src/gate/poller.py`** — `run_poller(client, cache, url, interval_s, *,
@@ -78,8 +81,10 @@ FastAPI app wires together.
   to `anchor_remaining_tokens(capacity, target_frac, usage_frac)`, and updates
   the `CapacityCache`. **Fails open** on any transport error / non-200 (keeps
   ALL state — caches and counter — no crash). **Fails closed (unconditional):**
-  an observed body missing a usable `vllm:kv_cache_size_tokens` gauge raises
-  `CapacityUnavailableError` (the app's fatal callback exits the process).
+  an observed body missing a usable KV-cache capacity (the
+  `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
+  `vllm:cache_config_info`) raises `CapacityUnavailableError` (the app's fatal
+  callback exits the process).
 - **`src/gate/router.py`** — `decision(usage_pct, ctx_tokens, thresholds) ->
   Decision`. Pure. The heart of the tiered gate: highest-tier-only selection +
   inclusive `ctx_tokens <= max_context` comparison. Also the always-on
@@ -508,11 +513,12 @@ proxy, not an inference engine.
    `record_*` must never change the decision, the 429, or the proxy path, and
    `/metrics` always returns 200 (never 429/404). (`stats.py`, `app.py`)
 
-10. **Unconditional fail-closed on a missing capacity gauge — but fail-open
+10. **Unconditional fail-closed on a missing KV-cache capacity — but fail-open
     while unreachable/stale.** The poller raises `CapacityUnavailableError`
     (and the app exits 1) **only** when an *observed* (HTTP 200) `/metrics` body
-    lacks a usable `vllm:kv_cache_size_tokens` gauge — a live vLLM that cannot
-    anchor the counter. A merely unreachable, erroring, or stale feed is **never
+    lacks a usable KV-cache capacity (the `vllm:kv_cache_size_tokens` gauge or
+    the `kv_cache_size_tokens` label on `vllm:cache_config_info`) — a live vLLM
+    that cannot anchor the counter. A merely unreachable, erroring, or stale feed is **never
     fatal**: it keeps all state and the app fails open via staleness (gotcha #1
     outranks the counter — a metrics outage never blocks traffic). Do not
     "helpfully" make the unreachable path fatal, and do not gate the fatal path

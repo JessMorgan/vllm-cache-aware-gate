@@ -11,8 +11,10 @@ request, decides one of two routes:
   **`HTTP 429` with a `Retry-After` header** telling it how long to wait.
 
 It learns the cache's headroom by polling vLLM's Prometheus `/metrics`
-endpoint and reading `vllm:kv_cache_usage_perc` (how full the cache is) and
-`vllm:kv_cache_size_tokens` (the cache's total size in tokens). It is designed
+endpoint and reading `vllm:kv_cache_usage_perc` (how full the cache is) and the
+KV-cache capacity in tokens — from the `vllm:kv_cache_size_tokens` gauge, or
+the `kv_cache_size_tokens` label on `vllm:cache_config_info` (the form current
+vLLM emits). It is designed
 for **safe, configuration-first, fail-open** operation: a monitoring outage
 never blocks inference traffic, and the gate is a transparent pass-through for
 the endpoints it proxies.
@@ -160,10 +162,11 @@ Capacity 100 000, target 85%, margin 1.25, retry 5/60.
 
 #### Fail-closed caveat
 
-- **A live vLLM whose `/metrics` lacks `vllm:kv_cache_size_tokens`** cannot be
-  anchored, so the gate **logs an error and exits with status 1** (the process
-  dies; an orchestrator restarts it). This is the only process-killing failure
-  and is deterministic.
+- **A live vLLM whose `/metrics` lacks a usable KV-cache capacity** (the
+  `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
+  `vllm:cache_config_info`) cannot be anchored, so the gate **logs an error and
+  exits with status 1** (the process dies; an orchestrator restarts it). This
+  is the only process-killing failure and is deterministic.
 - **An unreachable or stale feed is never fatal** — the gate **fails open**
   (forwards) and keeps retrying. A metrics outage never blocks traffic
   (invariant #1).
@@ -191,8 +194,9 @@ identically — autoconfig is always on.
 - A background async task polls `GET http://VLLM_HOST:VLLM_PORT/metrics` every
   `metrics_poll_interval_s` (default 2s) with **one GET per tick** and, from the
   same body, caches the latest `vllm:kv_cache_usage_perc` value (plus its fetch
-  timestamp and per-model breakdown) and the `vllm:kv_cache_size_tokens`
-  capacity. On a good poll it also re-anchors the remaining-KV counter
+  timestamp and per-model breakdown) and the KV-cache capacity (the
+  `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
+  `vllm:cache_config_info`). On a good poll it also re-anchors the remaining-KV counter
   (see [Autoconfig (always on)](#autoconfig-always-on)).
 - vLLM may emit one series per `model_name`. **v1 takes the max across all
   series** for both the usage and the capacity gauges (conservative for a
@@ -203,8 +207,9 @@ identically — autoconfig is always on.
     interval) it is treated as *unknown* → the request is **allowed** and a
     warning is logged.
 - **Fail-closed (unconditional):** an observed (HTTP 200) body that lacks a
-  usable `vllm:kv_cache_size_tokens` gauge cannot anchor the counter, so the
-  poller logs an error and the process exits with status 1 (see the
+  usable KV-cache capacity (the `vllm:kv_cache_size_tokens` gauge or the
+  `kv_cache_size_tokens` label on `vllm:cache_config_info`) cannot anchor the
+  counter, so the poller logs an error and the process exits with status 1 (see the
   [fail-closed caveat](#fail-closed-caveat)). A merely unreachable vLLM is
   never fatal.
 
@@ -259,8 +264,10 @@ curl http://localhost:8000/healthz
 `/healthz` always returns 200 for liveness; the body carries readiness info:
 `metrics_age_s` (age of the last successful metrics scrape), `kv_usage` (the
 last cached usage **fraction**, `null` if never fetched),
-`kv_cache_capacity_tokens` (the last cached `vllm:kv_cache_size_tokens` value,
-`null` if never observed), and `kv_cache_remaining_tokens` (the autoconfig
+`kv_cache_capacity_tokens` (the last cached KV-cache capacity — the
+`vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
+`vllm:cache_config_info` — `null` if never observed), and
+`kv_cache_remaining_tokens` (the autoconfig
 counter's current value, `null` if never anchored). Suitable for a Docker
 `HEALTHCHECK` or orchestrator liveness probe.
 
@@ -496,8 +503,10 @@ scrape_configs:
   endpoint, the gate keeps forwarding (it cannot measure headroom, so it does
   not block). Watch the warning logs and the `metrics_age_s` in `/healthz`.
 - **Fail-closed is the one exception.** A *live* vLLM whose `/metrics` body
-  lacks `vllm:kv_cache_size_tokens` cannot anchor the remaining-KV counter, so
-  the gate logs an error and exits with status 1 (an orchestrator restarts it).
+  lacks a usable KV-cache capacity (the `vllm:kv_cache_size_tokens` gauge or
+  the `kv_cache_size_tokens` label on `vllm:cache_config_info`) cannot anchor
+  the remaining-KV counter, so the gate logs an error and exits with status 1
+  (an orchestrator restarts it).
   An unreachable or stale feed is never fatal — that path fails open. See the
   [fail-closed caveat](#fail-closed-caveat).
 - **Startup log.** On a successful config load the gate logs the active

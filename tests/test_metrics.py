@@ -319,6 +319,59 @@ CAP_ONLY = "# TYPE vllm:kv_cache_size_tokens gauge\nvllm:kv_cache_size_tokens 10
 
 USAGE_ONLY = "# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc 0.42\n"
 
+# The shape current vLLM actually emits (vllm-project/vllm PR #42206): the
+# capacity is a *label* on the vllm:cache_config_info info gauge, not a
+# standalone vllm:kv_cache_size_tokens gauge.
+CONFIG_INFO_LABEL_ONLY = (
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="123433",'
+    'num_gpu_blocks="14835"} 1.0\n'
+)
+
+CONFIG_INFO_LABEL_NONE = (
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="None",'
+    'num_gpu_blocks="0"} 1.0\n'
+)
+
+CONFIG_INFO_TWO_MODELS = (
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="50000",'
+    'num_gpu_blocks="6000"} 1.0\n'
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="200000",'
+    'num_gpu_blocks="24000"} 1.0\n'
+)
+
+CONFIG_INFO_NON_NUMERIC = (
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="abc",'
+    'num_gpu_blocks="0"} 1.0\n'
+)
+
+CONFIG_INFO_NON_POSITIVE = (
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="0",'
+    'num_gpu_blocks="0"} 1.0\n'
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="-5",'
+    'num_gpu_blocks="0"} 1.0\n'
+)
+
+CONFIG_INFO_BOTH_SOURCES = (
+    "# TYPE vllm:kv_cache_size_tokens gauge\n"
+    "vllm:kv_cache_size_tokens 100000\n"
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="999999",'
+    'num_gpu_blocks="120000"} 1.0\n'
+)
+
+CONFIG_INFO_USAGE_FALLBACK = (
+    "# TYPE vllm:kv_cache_usage_perc gauge\n"
+    'vllm:kv_cache_usage_perc{model_name="llama-3-8b"} 0.42\n'
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",kv_cache_size_tokens="77777",'
+    'num_gpu_blocks="9000"} 1.0\n'
+)
+
 
 class TestParseKvCacheCapacity:
     def test_single_unlabelled_series(self) -> None:
@@ -351,6 +404,33 @@ class TestParseKvCacheCapacity:
         value = parse_kv_cache_capacity(CAP_MULTI)
         assert isinstance(value, int)
         assert value == 250000
+
+    def test_config_info_label_only(self) -> None:
+        # The real-world vLLM shape (PR #42206): no standalone gauge, only the
+        # kv_cache_size_tokens label on vllm:cache_config_info.
+        assert parse_kv_cache_capacity(CONFIG_INFO_LABEL_ONLY) == 123433
+
+    def test_config_info_label_none_string(self) -> None:
+        # Attention-free model: the label is the literal string "None".
+        assert parse_kv_cache_capacity(CONFIG_INFO_LABEL_NONE) is None
+
+    def test_config_info_two_samples_takes_max(self) -> None:
+        assert parse_kv_cache_capacity(CONFIG_INFO_TWO_MODELS) == 200000
+
+    def test_config_info_non_numeric_label(self) -> None:
+        assert parse_kv_cache_capacity(CONFIG_INFO_NON_NUMERIC) is None
+
+    def test_config_info_non_positive_labels(self) -> None:
+        # "0" and "-5" are not usable capacities.
+        assert parse_kv_cache_capacity(CONFIG_INFO_NON_POSITIVE) is None
+
+    def test_standalone_gauge_preferred_over_label(self) -> None:
+        # Both sources present: the standalone gauge wins.
+        assert parse_kv_cache_capacity(CONFIG_INFO_BOTH_SOURCES) == 100000
+
+    def test_fallback_when_standalone_absent(self) -> None:
+        # Usage gauge + config-info label, no standalone gauge.
+        assert parse_kv_cache_capacity(CONFIG_INFO_USAGE_FALLBACK) == 77777
 
 
 class TestFetchUsageByModel:
@@ -410,6 +490,19 @@ class TestFetchMetrics:
         assert sample.usage_frac is None
         assert sample.by_model is None
         assert sample.capacity_tokens == 100000
+
+    async def test_200_capacity_from_config_info_label(self) -> None:
+        # Regression test for the [major] defect: a live vLLM body that carries
+        # the usage gauge and the kv_cache_size_tokens *label* on
+        # vllm:cache_config_info (no standalone gauge) must yield a capacity.
+        transport = httpx.MockTransport(
+            lambda _req: httpx.Response(200, text=CONFIG_INFO_USAGE_FALLBACK)
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            sample = await fetch_metrics(client, "http://vllm:9000/metrics")
+        assert sample.observed is True
+        assert sample.usage_frac == pytest.approx(0.42)
+        assert sample.capacity_tokens == 77777
 
     async def test_500_returns_unobserved_sample(self) -> None:
         transport = httpx.MockTransport(lambda _req: httpx.Response(500, text="boom"))

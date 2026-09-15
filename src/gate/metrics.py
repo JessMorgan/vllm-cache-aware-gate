@@ -39,6 +39,14 @@ KV_CACHE_USAGE_METRIC = "vllm:kv_cache_usage_perc"
 #: Exact family name of the vLLM KV-cache capacity gauge (total tokens).
 KV_CACHE_CAPACITY_METRIC = "vllm:kv_cache_size_tokens"
 
+#: Family name of the vLLM cache-config info gauge. Current vLLM exposes the
+#: KV-cache capacity (in tokens) as the ``kv_cache_size_tokens`` *label* on
+#: this gauge rather than as a standalone gauge (vllm-project/vllm PR #42206).
+KV_CACHE_CONFIG_INFO_METRIC = "vllm:cache_config_info"
+
+#: Label carrying the KV-cache capacity (in tokens) on ``vllm:cache_config_info``.
+KV_CACHE_SIZE_TOKENS_LABEL = "kv_cache_size_tokens"
+
 
 def parse_kv_cache_usage(text: str) -> float | None:
     """Extract the max ``vllm:kv_cache_usage_perc`` sample from a text exposition.
@@ -114,18 +122,53 @@ def _finite_samples(text: str, family_name: str) -> list[float]:
     return values
 
 
-def parse_kv_cache_capacity(text: str) -> int | None:
-    """Extract the max ``vllm:kv_cache_size_tokens`` sample from a text exposition.
+def _capacity_from_config_info_labels(text: str) -> int | None:
+    """Read the ``kv_cache_size_tokens`` label off ``vllm:cache_config_info``.
 
-    Returns the maximum finite **positive** sample value across all label sets
-    (series) of the ``vllm:kv_cache_size_tokens`` family, as an ``int``.
-    Returns ``None`` when the text is unparseable, the metric is absent, it has
-    no samples, or every sample is non-finite or non-positive.
+    Current vLLM (PR #42206) exposes the KV-cache capacity as a *label* on the
+    ``vllm:cache_config_info`` info gauge (sample value ``1.0``) rather than as
+    a standalone ``vllm:kv_cache_size_tokens`` gauge. Returns the maximum
+    positive integer found across all samples' ``kv_cache_size_tokens`` labels,
+    or ``None`` when the family is absent, the label is missing or non-numeric
+    (e.g. ``"None"``), or no positive value is present.
     """
-    values = [v for v in _finite_samples(text, KV_CACHE_CAPACITY_METRIC) if v > 0]
+    try:
+        families = list(text_string_to_metric_families(text))
+    except ValueError:
+        return None
+    values: list[int] = []
+    for family in families:
+        if family.name != KV_CACHE_CONFIG_INFO_METRIC:
+            continue
+        for sample in family.samples:
+            raw = sample.labels.get(KV_CACHE_SIZE_TOKENS_LABEL)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                continue
+            if value > 0:
+                values.append(value)
     if not values:
         return None
-    return int(max(values))
+    return max(values)
+
+
+def parse_kv_cache_capacity(text: str) -> int | None:
+    """Extract the KV-cache capacity (total tokens) from a text exposition.
+
+    Tries the standalone ``vllm:kv_cache_size_tokens`` gauge first (maximum
+    finite **positive** sample value across all series, as an ``int``). When
+    that gauge is absent or has no positive sample, falls back to the
+    ``kv_cache_size_tokens`` **label** on the ``vllm:cache_config_info`` info
+    gauge — the form current vLLM actually emits (PR #42206). Returns ``None``
+    when neither source yields a positive integer.
+    """
+    values = [v for v in _finite_samples(text, KV_CACHE_CAPACITY_METRIC) if v > 0]
+    if values:
+        return int(max(values))
+    return _capacity_from_config_info_labels(text)
 
 
 @dataclass(frozen=True)
@@ -239,12 +282,13 @@ class CapacityCache:
 
 
 class CapacityUnavailableError(RuntimeError):
-    """Raised by the poller when an observed ``/metrics`` body lacks a usable capacity gauge.
+    """Raised by the poller when an observed ``/metrics`` body lacks a usable KV-cache capacity.
 
-    A live vLLM whose ``vllm:kv_cache_size_tokens`` gauge is absent cannot
-    anchor the remaining-KV counter, so the gate fails closed (the app exits
-    with status 1). A merely unreachable vLLM never raises this — that path
-    fails open (invariant #1).
+    A live vLLM whose body lacks a usable KV-cache capacity (the standalone
+    ``vllm:kv_cache_size_tokens`` gauge or the ``kv_cache_size_tokens`` label
+    on ``vllm:cache_config_info``) cannot anchor the remaining-KV counter, so
+    the gate fails closed (the app exits with status 1). A merely unreachable
+    vLLM never raises this — that path fails open (invariant #1).
     """
 
 

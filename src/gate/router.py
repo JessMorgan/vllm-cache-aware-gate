@@ -223,7 +223,9 @@ def anchor_remaining_tokens(capacity_tokens: int, target_frac: float, usage_frac
     ``floor(capacity_tokens * max(target_frac - clamp(usage_frac, 0, 1), 0))``.
 
     ``capacity_tokens`` is the total KV-cache size in tokens (from the
-    ``vllm:kv_cache_size_tokens`` gauge). ``target_frac`` and ``usage_frac``
+    ``vllm:kv_cache_size_tokens`` gauge, or the ``kv_cache_size_tokens``
+    label on ``vllm:cache_config_info`` when the gauge is absent).
+    ``target_frac`` and ``usage_frac``
     are **fractions in 0-1** (the caller converts the target percentage with
     ``pct / 100.0``). Usage at or above the target yields 0 — the cache is
     "full" for admission and every non-trivial request rejects until usage

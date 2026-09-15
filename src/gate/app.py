@@ -31,9 +31,11 @@ cannot reject while the feed is stale.
 
 **Unconditional fail-closed.** The poller raises
 :class:`~gate.metrics.CapacityUnavailableError` when an observed (HTTP 200)
-``/metrics`` body lacks ``vllm:kv_cache_size_tokens``; the app's fatal
-done-callback (:func:`_poller_fatal`) logs it and exits the process with
-status 1 (``os._exit(1)``). A merely unreachable vLLM is never fatal.
+``/metrics`` body lacks a usable KV-cache capacity — the standalone
+``vllm:kv_cache_size_tokens`` gauge or the ``kv_cache_size_tokens`` label on
+``vllm:cache_config_info``; the app's fatal done-callback
+(:func:`_poller_fatal`) logs it and exits the process with status 1
+(``os._exit(1)``). A merely unreachable vLLM is never fatal.
 
 Invariants (see AGENTS.md "Known gotchas"):
 
