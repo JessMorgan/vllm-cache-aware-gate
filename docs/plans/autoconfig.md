@@ -317,28 +317,35 @@ autoconfig** (60 > 30).
 
 ## 3. Files to Change/Create
 
+The branch base is `main` (`ddb166a`, post-observability), which has **none** of
+v1's capacity infrastructure (no `fetch_metrics`/`MetricsSample`/
+`CapacityCache`/`decision_auto`/`auto_mode`/CLI). v2 therefore **builds** all of
+that from scratch on top of `main`; the observability surface
+(`GateStats`, `GET /metrics`, `extract_request_model`, per-model
+`gate_kv_cache_usage_pct`) is already present and is only extended.
+
 | Path | Action | Description |
 |---|---|---|
-| `src/gate/config.py` | rework | Remove `auto_mode`, `auto_*` keys, `load_config(auto=...)`, thresholds-ignore logic. `thresholds` optional (drop ≥1 rule). Add 4 knobs with defaults + validation (§2 table). |
-| `src/gate/metrics.py` | modify | Keep v1's `KV_CACHE_CAPACITY_METRIC`, `parse_kv_cache_capacity`, `MetricsSample`, `fetch_metrics`, `CapacityCache`, `CapacityUnavailableError` (unchanged). Add `KvRemaining` (reanchor/subtract/value; single-loop contract; subtraction unclamped). |
-| `src/gate/router.py` | rework | `decision_auto(remaining_tokens, ctx_tokens, policy)`; `AutoPolicy(token_margin, retry_min_s, retry_max_s)` (target moves to anchor time); new pure `anchor_remaining_tokens(capacity, target_frac, usage_frac) -> int`, `scaled_retry_after(effective, remaining, min_s, max_s) -> int`, `combine_decisions(tier, auto) -> Decision`; reason `auto_unanchored` added, `auto_capacity_unknown` removed; `decision()` untouched. |
-| `src/gate/poller.py` | rework | Drop `require_capacity` (fatal is unconditional); new params `counter: KvRemaining`, `target_frac: float`; reanchor on observed usage+capacity; raise `CapacityUnavailableError` on observed body missing capacity. |
-| `src/gate/app.py` | rework | Own `KvRemaining`; staleness gate bypasses autoconfig; `combine_decisions`; `counter.subtract(...)` on every forward (pre-proxy); combined 429 (max retry, rejector-aware message); `/healthz` drops `mode`, adds `kv_cache_remaining_tokens`; `/metrics` sets the new gauge; fatal callback unchanged. |
-| `src/gate/stats.py` | modify | New gauge `gate_kv_cache_remaining_tokens` + `set_remaining(int \| None)` (None ⇒ NaN). |
-| `src/gate/main.py` | rework | No CLI (argparse removed); `load_config()`; startup log of autoconfig knobs + tier count. |
-| `tests/test_config.py` | rework | Zero-config valid; no-thresholds valid; 4 knobs (defaults/env/validation/NaN guards); thresholds fully parsed when present. |
-| `tests/test_metrics.py` | modify | Keep v1 capacity/`fetch_metrics`/by-model tests; add `KvRemaining` (reanchor, subtract, subtract-on-None no-op, negative drift, copy-free snapshot semantics). |
-| `tests/test_router.py` | rework | `decision_auto(remaining, ctx, policy)` table (None/None/inclusive boundary/reject); `scaled_retry_after` table (≤0 → max, clamp, ceil, monotonic); `anchor_remaining_tokens` table (usage > target → 0, clamp, floor); `combine_decisions` table (both allow / each-rejects / both-reject max-timeout + tie → tiered). Tiered `decision` tests unchanged. |
-| `tests/test_poller.py` | rework | Observed-without-capacity → raises (unconditional); transport error → no raise, caches **and counter** untouched; observed usage+capacity → counter reanchored to the exact formula; usage-absent/capacity-present → no reanchor, no raise; by-model tests (from observability) unchanged. |
-| `tests/test_api.py` | rework | Counter decrement across forwards (2nd identical request sees lower remaining); stale usage → fail-open **despite** an over-committed counter; both-layers-reject → max timeout + correct rejector; "small prompts only" scenario; zero-config app (no thresholds) end-to-end; `/healthz` fields (no `mode`); `/metrics` includes `gate_kv_cache_remaining_tokens` reflecting subtractions; fatal-callback test (unchanged shape). |
-| `tests/test_stats.py` | modify | `set_remaining` (value, negative, None → NaN). |
-| `tests/test_main.py` | rework | No CLI parsing; `load_config()` default wiring; startup log lines. |
-| `README.md` | rework | Replace "Auto mode" with "Autoconfig (always on)": counter model, two-layer AND, knob table, zero-config quickstart (plain `docker run vllm-gate`, no flags), fail-closed note, worked example, `/healthz` body, 429 max-timeout rule, new metric row. |
-| `config.example.yaml` | rework | `thresholds` documented as optional; replace `auto_*` block with the 4 knobs. |
-| `AGENTS.md` | rework | Project map (counter, reworked `decision_auto`, no mode); rewrite the autoconfig gotchas (unconditional fail-closed; counter semantics — reanchor/subtract/staleness-override; AND + max-timeout rejector; zero-config). |
-| `docker-compose.example.yaml` | modify | Drop the commented `--auto` variant (no flag exists). |
+| `src/gate/config.py` | modify | Add the 4 knobs (`target_kv_cache_pct` 85.0, `retry_min_s` 5, `retry_max_s` 60, `token_margin` 1.25) with defaults + validation + env overrides (§2 table); make `thresholds` **optional** (drop the ≥1 rule). Nothing to remove (no `auto_mode`/`auto_*`/`load_config(auto=)` in this base). |
+| `src/gate/metrics.py` | modify | Add the capacity infra (absent in this base): `KV_CACHE_CAPACITY_METRIC`, `parse_kv_cache_capacity`, `MetricsSample`, `fetch_metrics` (one GET → usage + by-model + capacity; supersedes the separate `fetch_usage`/`fetch_usage_by_model`), `CapacityCache`, `CapacityUnavailableError`; plus the new `KvRemaining` (reanchor/subtract/value; single-loop contract; subtraction unclamped). |
+| `src/gate/router.py` | modify | Add `decision_auto(remaining_tokens, ctx_tokens, policy)`, `AutoPolicy(token_margin, retry_min_s, retry_max_s)`, and the pure `anchor_remaining_tokens(capacity, target_frac, usage_frac) -> int`, `scaled_retry_after(effective, remaining, min_s, max_s) -> int`, `combine_decisions(tier, auto) -> Decision`; add the auto reason codes (`auto_unanchored`, `auto_within_headroom`, `auto_exceeds_headroom`). `decision()` untouched. |
+| `src/gate/poller.py` | modify | Switch to `fetch_metrics` (single fetch); add `counter: KvRemaining`, `target_frac: float`, `capacity_cache` params; re-anchor the counter on observed usage+capacity; raise `CapacityUnavailableError` **unconditionally** on an observed body missing capacity; update both caches. |
+| `src/gate/app.py` | modify | Add `CapacityCache` + `KvRemaining`; staleness gate bypasses autoconfig; `combine_decisions`; `counter.subtract(...)` on every forward (pre-proxy); combined 429 (max retry, rejector-aware message); `/healthz` adds `kv_cache_capacity_tokens` + `kv_cache_remaining_tokens`; `/metrics` sets the new gauge; add the fatal `os._exit(1)` callback. |
+| `src/gate/stats.py` | modify | Add the `gate_kv_cache_remaining_tokens` gauge + `set_remaining(int \| None)` (None ⇒ NaN). |
+| `src/gate/main.py` | modify | Add startup log of the autoconfig knobs + tier count. `load_config()` unchanged (no `auto` param in this base); no CLI to remove. |
+| `tests/test_config.py` | modify | Add zero-config / no-thresholds-validity tests + the 4 knobs (defaults/env/validation/NaN guards); thresholds parsed when present. |
+| `tests/test_metrics.py` | modify | Add capacity parsing / `fetch_metrics` / `CapacityCache` / `CapacityUnavailableError` tests (mirroring the existing usage/by-model style); add `KvRemaining` tests. |
+| `tests/test_router.py` | modify | Add `decision_auto` / `scaled_retry_after` / `anchor_remaining_tokens` / `combine_decisions` tables; tiered `decision` tests unchanged. |
+| `tests/test_poller.py` | modify | Add capacity / fatal / re-anchor / counter tests; keep the existing by-model tests. |
+| `tests/test_api.py` | modify | Add counter-decrement / both-layers-reject / zero-config / `/healthz` / `/metrics` / fatal-callback tests; keep the existing tiered + observability tests. |
+| `tests/test_stats.py` | modify | Add `set_remaining` (value, negative, None → NaN). |
+| `tests/test_main.py` | modify | Update for the startup log lines. |
+| `README.md` | modify | Add an "Autoconfig (always on)" section: counter model, two-layer AND + max-timeout rejector, knob table, zero-config quickstart (plain `docker run vllm-gate`, no flags), fail-closed note, worked example, `/healthz` body, 429 max-timeout rule, new metric row. |
+| `config.example.yaml` | modify | Document `thresholds` as **optional**; add the 4 knobs. |
+| `AGENTS.md` | modify | Add project-map lines (`KvRemaining`, `decision_auto`, `combine_decisions`); add the autoconfig gotchas (unconditional fail-closed; counter semantics — reanchor/subtract/staleness-override; AND + max-timeout rejector; zero-config). |
+| `docker-compose.example.yaml` | modify | No `--auto` variant (autoconfig is always on); note zero-config. |
 
-No new dependencies (no argparse; `prometheus_client` already present).
+No new dependencies (`prometheus_client` already present).
 
 ---
 
@@ -475,52 +482,56 @@ No new dependencies (no argparse; `prometheus_client` already present).
 
 ## 8. Implementation Order & State of the Branch
 
+**Branch state (2026-09-15):** `feat/auto-config` was **reset to `main`
+(`ddb166a`)** and re-committed with only the v2 plan doc (option (c) from the
+original decision list — the 8 v1 commits were discarded; they remain
+recoverable via `git reflog` / the pre-reset ref `59973ce`). v2 is therefore
+implemented **fresh on top of `main`**, not reworked in place.
+
 ```
-S1 config.py (knobs, optional thresholds, no mode)
- ├── S2a metrics.py (KvRemaining)                    ┐
- └── S2b router.py (decision_auto rework, anchor/retry/combine helpers)  ┘  S2a ∥ S2b
-      S3 poller.py (unconditional fatal, reanchor)        ← needs S2a, S2b
-      S4 app.py (staleness gate, AND, counter, healthz)   ← needs S1–S3
-         S4b stats.py (remaining gauge)                   ∥ S4 (parallel)
-         S5 main.py (no CLI, startup logs)                ← needs S1, S4
-         S6 docs (README, config.example, AGENTS.md, compose) ← needs S5
+Wave 1 (parallel — no cross-imports of new symbols):
+  S1 config.py    (4 knobs, optional thresholds)
+  S2 metrics.py   (capacity infra from scratch + KvRemaining)
+  S2c router.py   (decision_auto, anchor/retry/combine pure helpers)
+  S4b stats.py    (gate_kv_cache_remaining_tokens gauge)
+Wave 2:
+  S3 poller.py    (fetch_metrics, unconditional fatal, reanchor)   ← needs S2, S2c
+Wave 3:
+  S4 app.py       (staleness gate, AND, counter, healthz, fatal)   ← needs S1, S2, S2c, S3, S4b
+Wave 4:
+  S5 main.py      (startup logs)                                    ← needs S1, S4
+Wave 5:
+  S6 docs         (README, config.example, AGENTS.md, compose)      ← needs S5
 ```
 
-**The 8 v1 commits (`6d5a578..48ea8da`) implement the superseded design** and
-will be reworked by the segments above. What v1 built that v2 keeps:
-`fetch_metrics`/`MetricsSample`/capacity parsing/`CapacityCache`/
-`CapacityUnavailableError` (metrics.py — unchanged), the observability merge
-(stats wiring in app.py, by-model tests), and the fatal-callback shape.
-What changes: config surface, `decision_auto`'s inputs/shape, poller
-contract, app decision path, main (CLI removed), the 429 semantics, healthz,
-plus the new counter/gauge.
-
-**Commit handling — user decision required before rework** (all options keep
-the branch unmerged, so history rewriting is in scope per Dev-style rule 10):
-
-- **(a) Layer v2 on top of v1.** Keep the 8 v1 commits; add the S1–S6 rework
-  as new segment commits. History shows the design evolution; the v1 commits
-  are annotated "superseded by v2" in the branch (not in history).
-- **(b) Collapse v1, then land v2.** Rewrite the v1 code commits into one
-  `WIP: autoconfig v1 design (superseded)` commit (keep the plan-doc commit),
-  then land the v2 segments cleanly.
-- **(c) Fresh start.** Reset `feat/auto-config` to `main` (`ddb166a`) and
-  commit only v2 (v1 exists only via reflog / pre-rebase refs). Cleanest
-  final history; discards v1 from the branch.
-
-Rebase onto the feature branch at each merge point; before merge: full local
-CI, distinct-model review per the AGENTS.md gate, then `git merge --no-ff`
-into `main`.
+- **Wave 1 is the max-parallelism point** (4 workstreams, each scoped to its
+  own file + tests; the four leaf modules don't cross-import each other's new
+  symbols). S2 is the largest workstream (capacity infra is built from
+  scratch, not kept from v1).
+- **Segments S1–S6 are the commit boundaries** (one commit per segment; tests
+  are written with each segment — no separate test segment). Intermediate
+  commits may not be independently full-suite-green (e.g. S2 adds
+  `fetch_metrics` while `poller.py` still calls `fetch_usage_by_model`); the
+  **final** state must be fully green.
+- Before merge: full local CI, distinct-model review per the AGENTS.md gate,
+  then `git merge --no-ff` into `main`.
 
 ---
 
-## 9. Relationship to observability (now merged — historical)
+## 9. Relationship to observability (merged in `main`)
 
-The v1↔observability rebase is **done** (branch base is `main` = `ddb166a`):
-the unified `fetch_metrics`/`MetricsSample` (usage + by-model + capacity from
-one GET) is the shared fetch layer, and the stats wiring
-(`GateStats`, `GET /metrics`, `extract_request_model`, per-model
-`gate_kv_cache_usage_pct`) is merged into `app.py`. v2's only touch to the
-observability surface is the new `gate_kv_cache_remaining_tokens` gauge (S4b,
-small additive change to `stats.py`). The `docs/plans/observability.md`
-plan is unaffected.
+The observability feature is **in `main`** (branch base `ddb166a`):
+`GateStats` with the per-app registry, `GET /metrics`, `extract_request_model`,
+and the per-model `gate_kv_cache_usage_pct` gauge are already wired into
+`app.py`. v2's touches to the observability surface:
+
+- **Fetch-layer unification (S2).** `main` currently fetches via two separate
+  functions (`fetch_usage`, `fetch_usage_by_model` — two GETs per poll in the
+  poller's design). v2 replaces them with a single `fetch_metrics() ->
+  MetricsSample` (usage + by-model + capacity from **one** GET). This is the
+  "A2 alignment" the observability plan anticipated; the by-model parse/cache
+  behavior is preserved, only the fetch edge is unified.
+- **New gauge (S4b).** `gate_kv_cache_remaining_tokens` (the gate's own live
+  estimate) alongside the real `gate_kv_cache_usage_pct`.
+
+`docs/plans/observability.md` is otherwise unaffected.
