@@ -60,8 +60,8 @@ else
   fail "Linting"
 fi
 
-# 4. Typecheck
-if .venv/bin/mypy src/; then
+# 4. Typecheck (mypy + compileall, mirroring the typecheck job's steps)
+if .venv/bin/mypy src/ && .venv/bin/python -m compileall -q src/; then
   pass "Typecheck"
 else
   fail "Typecheck"
@@ -80,7 +80,21 @@ else
   fail "Unit tests (coverage gate)"
 fi
 
-# 6. Container build (skip, not fail, when docker is unavailable)
+# 6. Dependency audit (project-path form: reads declared deps from pyproject.toml)
+if .venv/bin/pip-audit .; then
+  pass "Dependency audit"
+else
+  fail "Dependency audit"
+fi
+
+# 7. Pre-commit hooks
+if .venv/bin/pre-commit run --all-files --show-diff-on-failure; then
+  pass "Pre-commit hooks"
+else
+  fail "Pre-commit hooks"
+fi
+
+# 8. Container build (skip, not fail, when docker is unavailable)
 if command -v docker >/dev/null 2>&1; then
   if docker build -t vllm-gate:ci .; then
     pass "Container build"

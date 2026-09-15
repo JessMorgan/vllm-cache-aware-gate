@@ -268,15 +268,18 @@ fail-open / streaming paths are all exercised without a real model or GPU.
 
 - **Local CI**: `bash scripts/local-ci.sh` (or `make ci`) runs the exact same
   checks as the GitHub Actions CI (`.github/workflows/tests.yml`) —
-  source-tracking, `ruff format --check`, `ruff check`, `mypy src/`, pytest
-  with the 80% coverage gate, and the container build — in the same order. A
-  green local run should mean a green CI run (the container step is skipped
-  with a warning if docker is absent).
+  source-tracking, `ruff format --check`, `ruff check`, `mypy src/` +
+  `python -m compileall -q src/`, pytest with the 80% coverage gate,
+  `pip-audit` dependency audit, `pre-commit run --all-files`, and the
+  container build — in the same order. A green local run should mean a green
+  CI run (the container step is skipped with a warning if docker is absent).
 - **CI jobs** (`.github/workflows/tests.yml`): on push to `main` and on
   pull requests, CI runs the `format`, `lint`, `typecheck`, and `test`
   (pytest + 80% coverage on Python 3.11/3.12/3.13) jobs, plus
-  `source-tracking`. The `container` job (docker build, no push) is gated on
-  all of the others, so a code failure blocks the image build.
+  `source-tracking`, `security` (pip-audit dependency audit), and
+  `pre-commit` (pre-commit hooks). The `container` job (docker build, no
+  push) is gated on all of the others, so a code failure blocks the image
+  build.
 - **Releases** (`.github/workflows/release.yml`): after the checks pass, the
   release job builds multi-platform images
   (`linux/amd64,linux/arm64`) and pushes them to GHCR — tagged with the
@@ -284,9 +287,9 @@ fail-open / streaming paths are all exercised without a real model or GPU.
    non-prerelease `v*` tags (prerelease tags like `vX.Y.Z-rcN` get only their
    version tag). Prerelease tags (e.g. `vX.Y.Z-rc1`) produce a draft +
    prerelease GitHub Release.
-- **Local dev hooks**: `.pre-commit-config.yaml` installs pre-commit hooks
-  (ruff + ruff-format plus basic hygiene checks) for convenience. They are
-  dev-time only — the CI workflows are the authoritative gate.
+- **Pre-commit hooks**: `.pre-commit-config.yaml` installs pre-commit hooks
+  (ruff + ruff-format plus basic hygiene checks). They run in CI (the
+  `pre-commit` job) and are also available locally before committing.
 - **Dependency updates**: Dependabot (`.github/dependabot.yml`) opens weekly
   update PRs for `pip` dependencies and GitHub Actions.
 

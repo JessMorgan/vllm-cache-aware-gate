@@ -93,10 +93,12 @@ make format                        # ruff format src/ tests/
 
 `scripts/local-ci.sh` (or `make ci`) is the **exact local equivalent of
 `.github/workflows/tests.yml`**: it runs the same checks, in the same order
-(source-tracking, `ruff format --check`, `ruff check`, `mypy`, pytest with the
-80% coverage gate, container build), with pass/fail tracking instead of
-aborting on the first failure. A green local run should mean a green CI run;
-the container job is skipped (with a warning) when docker is absent.
+(source-tracking, `ruff format --check`, `ruff check`, `mypy` +
+`compileall`, pytest with the 80% coverage gate, `pip-audit` dependency
+audit, `pre-commit run --all-files`, container build), with pass/fail
+tracking instead of aborting on the first failure. A green local run should
+mean a green CI run; the container job is skipped (with a warning) when
+docker is absent.
 
 The `tests/test_api.py` suite drives the gate end-to-end against a fake vLLM
 (`httpx.ASGITransport` + a mock upstream transport), so the allow / 429 /
@@ -295,13 +297,16 @@ Before committing any complete change:
 ## CI / release / local parity
 
 - **CI** (`.github/workflows/tests.yml`): runs on push to `main`, PRs, and
-  manual dispatch, as six jobs — `source-tracking` (fails if any `*.py` under
-  `src/` is git-ignored), `format` (`ruff format --check src/ tests/`), `lint`
-  (`ruff check .`), `typecheck` (`mypy src/`), `test` (pytest with the 80%
-  coverage gate on a Python 3.11/3.12/3.13 matrix, coverage XML uploaded as an
-  artifact), and `container` (docker build, no push). The `container` job is
-  gated by `needs:` on all the others, so a code failure blocks the image
-  build.
+  manual dispatch, as eight jobs — `source-tracking` (fails if any `*.py`
+  under `src/` is git-ignored), `format` (`ruff format --check src/ tests/`),
+  `lint` (`ruff check .`), `typecheck` (`mypy src/` +
+  `python -m compileall -q src/`), `test` (pytest with the 80% coverage gate
+  on a Python 3.11/3.12/3.13 matrix, coverage XML uploaded as an artifact),
+  `security` (`pip-audit .` — audits the declared dependencies against the
+  PyPI advisory DB), `pre-commit` (`pre-commit run --all-files
+  --show-diff-on-failure`), and `container` (docker build, no push). The
+  `container` job is gated by `needs:` on all the others, so a code failure
+  blocks the image build.
 - **Release** (`.github/workflows/release.yml`): a `ci` gate job runs the four
   code checks (`ruff format --check`, `ruff check`, `mypy src/`,
   `pytest --cov=gate --cov-fail-under=80`) — not the source-tracking or
@@ -312,10 +317,12 @@ Before committing any complete change:
   Release (generated notes) on tag pushes.
 - **Dependabot** (`.github/dependabot.yml`): weekly (Monday 09:00 UTC) updates
   for `pip` (`deps` prefix) and `github-actions` (`ci` prefix).
-- **Pre-commit hooks** (`.pre-commit-config.yaml`): dev-time only — **not** a
-  CI gate; CI is authoritative. ruff + ruff-format (pinned to the project's
-  ruff version) plus hygiene hooks (check-yaml, end-of-file-fixer,
-  trailing-whitespace, check-added-large-files, check-merge-conflict).
+- **Pre-commit hooks** (`.pre-commit-config.yaml`): run in CI by the
+  `pre-commit` job (`pre-commit run --all-files --show-diff-on-failure`) and
+  available as dev-time hooks before committing. ruff + ruff-format (pinned to
+  the project's ruff version) plus hygiene hooks (check-yaml,
+  end-of-file-fixer, trailing-whitespace, check-added-large-files,
+  check-merge-conflict).
 - **Local parity**: `bash scripts/local-ci.sh` / `make ci` runs the exact
   checks from `tests.yml` in the same order (see "Smoke / test commands").
   `scripts/pre-push-tests.sh` runs the full suite with the 80% coverage gate

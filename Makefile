@@ -1,6 +1,6 @@
 VENV := .venv
 
-.PHONY: venv install lint typecheck test coverage build run-local clean format ci
+.PHONY: venv install lint typecheck test coverage build run-local clean format ci security
 
 venv:
 	python3 -m venv $(VENV)
@@ -22,6 +22,9 @@ test:
 
 coverage:
 	$(VENV)/bin/pytest --cov=gate --cov-fail-under=80
+
+security:
+	$(VENV)/bin/pip-audit .
 
 ci:
 	bash scripts/local-ci.sh

@@ -1,7 +1,8 @@
-# Dev-time pre-commit hooks — NOT a CI gate. CI (.github/workflows) is the
-# authoritative check; these hooks just catch issues locally before you commit.
-# The ruff / ruff-format hook versions are pinned to the project's ruff version
-# (see pyproject.toml / the venv) so local and CI behavior match.
+# Pre-commit hooks. These run in CI (the `pre-commit` job in
+# .github/workflows/tests.yml) and are also available as local dev-time hooks
+# before you commit. The ruff / ruff-format hook versions are pinned to the
+# project's ruff version (see pyproject.toml / the venv) so local and CI
+# behavior match.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.7
