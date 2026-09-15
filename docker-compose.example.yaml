@@ -1,0 +1,44 @@
+# Example only — adjust to your deployment.
+#
+# Reference stack: the gate in front of a vLLM instance.
+#
+# The `vllm` service below is a PLACEHOLDER. It needs a GPU (vLLM does not
+# run usefully on CPU), so:
+#   - For local GPU development: uncomment the `command:` line and set the
+#     model you want to serve.
+#   - In production you will usually point `VLLM_HOST` at an external vLLM
+#     instance instead — in that case remove the `vllm` service (and the
+#     `depends_on`) entirely and set `VLLM_HOST`/`VLLM_PORT` to that
+#     instance's address.
+services:
+  gate:
+    build: .
+    image: vllm-gate:latest
+    ports:
+      - "8000:8000"
+    environment:
+      VLLM_HOST: vllm
+      VLLM_PORT: "8000"
+      THRESHOLDS_JSON: '[{"kv_pct":50,"max_context":4096,"timeout_s":15},{"kv_pct":80,"max_context":1024,"timeout_s":30}]'
+      LOG_LEVEL: INFO
+    # Alternative to THRESHOLDS_JSON: mount a config file instead.
+    # volumes:
+    #   - ./config.json:/etc/gate/config.json:ro
+    healthcheck:
+      test:
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    depends_on:
+      - vllm
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    # PLACEHOLDER — requires a GPU. Example:
+    # command: --model Qwen/Qwen2.5-0.5B-Instruct
+    # ports:
+    #   - "8001:8000"

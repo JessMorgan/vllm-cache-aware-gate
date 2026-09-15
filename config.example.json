@@ -1,0 +1,14 @@
+{
+  "vllm_host": "vllm",
+  "vllm_port": 8000,
+  "listen_host": "0.0.0.0",
+  "listen_port": 8000,
+  "metrics_poll_interval_s": 2.0,
+  "stale_after_s": 6.0,
+  "chars_per_token": 4,
+  "default_max_tokens": 256,
+  "thresholds": [
+    { "kv_pct": 50, "max_context": 4096, "timeout_s": 15 },
+    { "kv_pct": 80, "max_context": 1024, "timeout_s": 30 }
+  ]
+}
