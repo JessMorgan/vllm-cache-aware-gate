@@ -1,4 +1,4 @@
-"""Tests for gate.tokens: prompt token estimation (pure, fail-open)."""
+"""Tests for gate.tokens: prompt token estimation and model extraction (pure, fail-open)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import math
 
 from gate.config import GateConfig
-from gate.tokens import estimate_context_tokens
+from gate.tokens import estimate_context_tokens, extract_request_model
 
 
 def make_cfg(chars_per_token: int = 4, default_max_tokens: int = 256) -> GateConfig:
@@ -246,3 +246,62 @@ def test_empty_string_message_headroom_only():
     cfg = make_cfg(chars_per_token=4, default_max_tokens=256)
     payload = {"messages": [{"role": "user", "content": ""}]}
     assert estimate_context_tokens(body_bytes(payload), cfg) == 256
+
+
+# --- extract_request_model ----------------------------------------------------
+
+
+def test_extract_model_chat_body():
+    payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    assert extract_request_model(body_bytes(payload)) == "m"
+
+
+def test_extract_model_completions_body():
+    payload = {"model": "x", "prompt": "hello"}
+    assert extract_request_model(body_bytes(payload)) == "x"
+
+
+def test_extract_model_missing_key():
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    assert extract_request_model(body_bytes(payload)) == "unknown"
+
+
+def test_extract_model_non_string_values():
+    for bad in (123, ["m"], {"a": 1}, None, True):
+        payload = {"model": bad, "messages": [{"role": "user", "content": "hi"}]}
+        assert extract_request_model(body_bytes(payload)) == "unknown"
+
+
+def test_extract_model_empty_and_whitespace_only():
+    for empty in ("", "   "):
+        payload = {"model": empty, "messages": [{"role": "user", "content": "hi"}]}
+        assert extract_request_model(body_bytes(payload)) == "unknown"
+
+
+def test_extract_model_invalid_utf8():
+    assert extract_request_model(b"\xff\xfe\x00garbage") == "unknown"
+
+
+def test_extract_model_invalid_json():
+    assert extract_request_model(b"{not json") == "unknown"
+
+
+def test_extract_model_json_list():
+    assert extract_request_model(body_bytes([1, 2, 3])) == "unknown"
+
+
+def test_extract_model_deeply_nested_json():
+    """Pathologically nested JSON makes the parser raise RecursionError;
+    that is an unparseable body, so the label is 'unknown', never a crash."""
+    assert extract_request_model(b"[" * 10000 + b"]" * 10000) == "unknown"
+
+
+def test_extract_model_non_ascii_returned_unchanged():
+    payload = {"model": "modèle-ünïcode", "messages": [{"role": "user", "content": "hi"}]}
+    assert extract_request_model(body_bytes(payload)) == "modèle-ünïcode"
+
+
+def test_extract_model_surrounding_spaces_returned_unstripped():
+    """The original, unstripped value is returned: '  m  ' is not 'm'."""
+    payload = {"model": "  m  ", "messages": [{"role": "user", "content": "hi"}]}
+    assert extract_request_model(body_bytes(payload)) == "  m  "
