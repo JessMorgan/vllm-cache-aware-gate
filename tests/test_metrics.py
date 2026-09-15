@@ -356,6 +356,11 @@ CONFIG_INFO_NON_POSITIVE = (
     'num_gpu_blocks="0"} 1.0\n'
 )
 
+CONFIG_INFO_LABEL_MISSING = (
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="16",num_gpu_blocks="0"} 1.0\n'
+)
+
 CONFIG_INFO_BOTH_SOURCES = (
     "# TYPE vllm:kv_cache_size_tokens gauge\n"
     "vllm:kv_cache_size_tokens 100000\n"
@@ -413,6 +418,11 @@ class TestParseKvCacheCapacity:
     def test_config_info_label_none_string(self) -> None:
         # Attention-free model: the label is the literal string "None".
         assert parse_kv_cache_capacity(CONFIG_INFO_LABEL_NONE) is None
+
+    def test_config_info_label_missing(self) -> None:
+        # A cache_config_info sample that lacks the kv_cache_size_tokens label
+        # is skipped; with no other source the capacity is unknown.
+        assert parse_kv_cache_capacity(CONFIG_INFO_LABEL_MISSING) is None
 
     def test_config_info_two_samples_takes_max(self) -> None:
         assert parse_kv_cache_capacity(CONFIG_INFO_TWO_MODELS) == 200000

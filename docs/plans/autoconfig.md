@@ -1,6 +1,7 @@
 # Autoconfig (always-on KV admission) — Design Plan
 
-Status: **draft v2, pending implementation** (2026-09-15)
+Status: **implemented** (2026-09-15; see Round 3 for the capacity-source
+correction)
 Branch: `feat/auto-config` (worktree `/tmp/opencode/autoconfig`, base `main` =
 `ddb166a`, post-observability rebase)
 
@@ -15,6 +16,21 @@ capacity) and the observability stats wiring (`GateStats`, `GET /metrics`,
 ---
 
 ## Decision log
+
+**Round 3 (2026-09-15 — capacity source correction):**
+
+12. **Capacity is read from two sources, not one.** vLLM (PR #42206, merged
+    2026-06-12) exposes the KV-cache capacity as the `kv_cache_size_tokens`
+    **label** on the `vllm:cache_config_info` info gauge (sample value `1.0`),
+    not as a standalone `vllm:kv_cache_size_tokens` gauge. `parse_kv_cache_capacity`
+    therefore tries the standalone gauge first (it wins if it yields a positive
+    value) and falls back to the `kv_cache_size_tokens` label on
+    `vllm:cache_config_info` (string→int, skipping `"None"`/non-numeric/
+    non-positive, max across samples). This supersedes the single-source
+    wording in decision 7 and §1/§2/§3 below: "missing `vllm:kv_cache_size_tokens`"
+    now means "missing a *usable* capacity — neither the standalone gauge nor
+    the label." The unconditional fail-closed behavior (decision 7) is
+    unchanged; only the source it reads is broadened.
 
 **Round 2 (2026-09-15 — current):**
 

@@ -33,7 +33,9 @@ Invariants (see AGENTS.md "Known gotchas" #1):
   the value then ages out and the app layer fails open via
   :meth:`MetricsCache.is_stale`.
 - The loop never crashes on a transport error. The ONLY fatal path is an
-  observed 200 body missing the capacity gauge.
+  observed 200 body missing a usable KV-cache capacity (the
+  ``vllm:kv_cache_size_tokens`` gauge or the ``kv_cache_size_tokens`` label on
+  ``vllm:cache_config_info``).
 """
 
 from __future__ import annotations
