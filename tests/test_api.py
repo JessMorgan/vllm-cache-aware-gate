@@ -326,3 +326,128 @@ def test_completions_endpoint_low_usage_forwards() -> None:
     assert resp.status_code == 200
     assert len(fake.requests) == 1
     assert fake.requests[0]["path"] == "/v1/completions"
+
+
+# --- /metrics ---------------------------------------------------------------
+
+
+def test_metrics_endpoint_200_and_content_type() -> None:
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    with build_app(make_config(), cache, fake) as client:
+        resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+
+
+def test_metrics_contains_required_families() -> None:
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    with build_app(make_config(), cache, fake) as client:
+        body = client.get("/metrics").text
+    for family in (
+        "gate_requests_total",
+        "gate_request_ctx_tokens",
+        "gate_kv_cache_usage_pct",
+        "gate_config_info",
+        "gate_metrics_fresh",
+        "gate_metrics_age_s",
+    ):
+        assert family in body
+
+
+def test_metrics_counts_forwarded_and_rejected() -> None:
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    cfg = make_config()
+    with build_app(cfg, cache, fake) as client:
+        cache.update(0.10)  # low usage -> forwards
+        resp = client.post("/v1/chat/completions", content=chat_body(100), headers=JSON_HEADERS)
+        assert resp.status_code == 200
+        cache.update(0.90)  # high usage -> 80-tier, max_context 1024
+        body = completions_body(5000)  # estimate ~1506 > 1024 -> 429
+        assert estimate_context_tokens(body, cfg) > 1024
+        resp = client.post("/v1/completions", content=body, headers=JSON_HEADERS)
+        assert resp.status_code == 429
+        metrics_body = client.get("/metrics").text
+    assert 'gate_requests_total{endpoint="chat_completions",model="m",result="forwarded"} 1.0' in (
+        metrics_body
+    )
+    assert 'gate_requests_total{endpoint="completions",model="m",result="rejected"} 1.0' in (
+        metrics_body
+    )
+
+
+def test_metrics_per_model_series() -> None:
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    cache.update(0.10)
+    other_body = json.dumps(
+        {"model": "other-model", "messages": [{"role": "user", "content": "a" * 100}]}
+    ).encode()
+    with build_app(make_config(), cache, fake) as client:
+        resp1 = client.post("/v1/chat/completions", content=chat_body(100), headers=JSON_HEADERS)
+        assert resp1.status_code == 200
+        resp2 = client.post("/v1/chat/completions", content=other_body, headers=JSON_HEADERS)
+        assert resp2.status_code == 200
+        metrics_body = client.get("/metrics").text
+    assert 'gate_requests_total{endpoint="chat_completions",model="m",result="forwarded"}' in (
+        metrics_body
+    )
+    assert (
+        'gate_requests_total{endpoint="chat_completions",model="other-model",result="forwarded"}'
+        in metrics_body
+    )
+
+
+def test_metrics_kv_usage_gauge() -> None:
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    cache.update_by_model({"X": 0.8})
+    with build_app(make_config(), cache, fake) as client:
+        body = client.get("/metrics").text
+    assert 'gate_kv_cache_usage_pct{model_name="X"} 80.0' in body
+
+
+def test_stats_failure_does_not_break_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stats recording failure must not 500 the request (fail-open invariant)."""
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("stats boom")
+
+    monkeypatch.setattr("gate.stats.GateStats.record_forwarded", _raise)
+    monkeypatch.setattr("gate.stats.GateStats.record_rejected", _raise)
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    cfg = make_config()
+    with build_app(cfg, cache, fake) as client:
+        cache.update(0.10)  # low usage -> forwards
+        fwd = client.post("/v1/chat/completions", content=chat_body(100), headers=JSON_HEADERS)
+        assert fwd.status_code == 200  # forwarded despite stats failure
+        cache.update(0.90)  # high usage -> 429
+        body = completions_body(5000)  # estimate ~1506 > 1024
+        assert estimate_context_tokens(body, cfg) > 1024
+        rej = client.post("/v1/completions", content=body, headers=JSON_HEADERS)
+        assert rej.status_code == 429  # rejected despite stats failure
+
+
+def test_metrics_not_404_and_unknown_still_404() -> None:
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    with build_app(make_config(), cache, fake) as client:
+        assert client.get("/metrics").status_code == 200
+        assert client.get("/v1/embeddings").status_code == 404
+
+
+def test_healthz_unchanged() -> None:
+    """Adding /metrics must not disturb /healthz."""
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    cache.update(0.42)
+    with build_app(make_config(), cache, fake) as client:
+        resp = client.get("/healthz")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert "metrics_age_s" in data
+    assert data["kv_usage"] == pytest.approx(0.42)

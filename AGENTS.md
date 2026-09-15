@@ -44,35 +44,54 @@ FastAPI app wires together.
   overrides, then validates strictly. `kv_pct` is a **percentage (0–100)**;
   the vLLM metric is a **fraction (0–1)**. The `THRESHOLDS_JSON` env override
   is still parsed as JSON (a JSON list), even though the file is YAML.
-- **`src/gate/tokens.py`** — `estimate_context_tokens(body, cfg) -> int`.
-  Pure. Estimates prompt tokens as `ceil(prompt_chars / chars_per_token)` plus
-  `max_tokens` headroom (default 256). Chat vs completions prompt-text
-  extraction. Intentionally a heuristic (no tokenizer dependency).
+- **`src/gate/tokens.py`** — `estimate_context_tokens(body, cfg) -> int |
+  None`. Pure. Estimates prompt tokens as `ceil(prompt_chars / chars_per_token)`
+  plus `max_tokens` headroom (default 256); returns `None` on an
+  unparseable body (caller fails open). Chat vs completions prompt-text
+  extraction. Intentionally a heuristic (no tokenizer dependency). Also
+  `extract_request_model(body) -> str` (pure, never raises): the request
+  body's `model` string, or `"unknown"` — the stats label and future
+  routing key, never used in the decision.
 - **`src/gate/metrics.py`** — `parse_kv_cache_usage(text) -> float | None`
-  (regex over `vllm:kv_cache_usage_perc`, **max across all series**), and
-  `MetricsCache` (last value + `fetched_at` + `age()`).
+  (max across all `vllm:kv_cache_usage_perc` series),
+  `parse_kv_cache_usage_by_model(text) -> dict[str, float] | None` (per-model
+  fractions keyed by `model_name`, `"default"` when unlabeled), and
+  `MetricsCache` (last value + `fetched_at` + `age()`; `by_model()` stores the
+  per-model breakdown while `_value` stays the MAX of it).
 - **`src/gate/poller.py`** — `run_poller(...)`: async background task that fetches
   `http://VLLM_HOST:VLLM_PORT/metrics` every `metrics_poll_interval_s`, updates the
-  cache, and **fails open** on error (keeps last value; no crash).
+  cache with the per-model breakdown (`fetch_usage_by_model` / `update_by_model`),
+  and **fails open** on error (keeps last value; no crash).
 - **`src/gate/router.py`** — `decision(usage_pct, ctx_tokens, thresholds) ->
   Decision`. Pure. The heart of the gate: highest-tier-only selection +
   inclusive `ctx_tokens <= max_context` comparison.
 - **`src/gate/proxy.py`** — `proxy_request(httpx, request) -> Response`.
   Transparent forward of method/path/query/headers/body; streams SSE verbatim;
   strips hop-by-hop headers; propagates upstream status (does not mask 5xx).
+- **`src/gate/stats.py`** — `GateStats`: the stats edge. Owns a **per-app
+  `prometheus_client.CollectorRegistry`** (never the global default), the
+  `gate_*` metric objects, and `render()` (Prometheus text exposition for
+  `GET /metrics`). In-memory only; resets on restart by design.
+  `record_forwarded/rejected`, `set_kv_usage` (fraction→percent, removes stale
+  model series), `set_freshness`.
 - **`src/gate/app.py`** — Builds the FastAPI app: routes
-  (`POST /v1/chat/completions`, `POST /v1/completions`, `GET /healthz`), the 429
-  builder, and wiring of poller + cache + proxy.
+  (`POST /v1/chat/completions`, `POST /v1/completions`, `GET /healthz`,
+  `GET /metrics`), the 429 builder, and wiring of poller + cache + proxy +
+  stats (each decision is recorded as a pure side effect; `/metrics` renders
+  the stats and always returns 200).
 - **`src/gate/main.py`** — `main()` entrypoint: load config, start the poller as a
   background task, run uvicorn; graceful shutdown.
 - **`tests/`** — `test_tokens.py`, `test_router.py`, `test_metrics.py`,
-  `test_api.py` (ASGI end-to-end with a fake vLLM), `test_poller.py`.
+  `test_stats.py`, `test_api.py` (ASGI end-to-end with a fake vLLM),
+  `test_poller.py`.
 - **`Dockerfile`**, **`docker-compose.example.yaml`**, **`config.example.yaml`**,
   **`Makefile`**, **`README.md`** — packaging, operator reference, and docs.
 
 **Proxied endpoints (v1):** `POST /v1/chat/completions` and
-`POST /v1/completions` (both consume KV cache). `GET /healthz` for liveness.
-Everything else → 404. No auth, no TLS termination (v1).
+`POST /v1/completions` (both consume KV cache). `GET /healthz` for liveness,
+`GET /metrics` for the gate's own Prometheus stats (gate-local, never proxied,
+never 429s — always 200). Everything else → 404. No auth, no TLS
+termination (v1).
 
 ## Smoke / test commands (no external services required)
 
@@ -380,8 +399,9 @@ When considering a dependency:
   need.
 
 For this project the runtime footprint is deliberately tiny (`fastapi`,
-`uvicorn[standard]`, `httpx`, `prometheus_client` for its text parser,
-`PyYAML` for config parsing). Do not
+`uvicorn[standard]`, `httpx`, `prometheus_client` for both its text parser and
+its client-side `CollectorRegistry` (gate's own `/metrics`), `PyYAML` for
+config parsing). Do not
 pull in a tokenizer, an LLM SDK, or a large framework in v1 — the gate is a
 proxy, not an inference engine.
 
@@ -435,10 +455,26 @@ proxy, not an inference engine.
    that would break that contract without an explicit, default-off config flag.
    (`app.py`, `config.py`)
 
+9. **Stats are in-memory, reset on restart, and recording never alters the
+   decision.** `GateStats` keeps everything in a per-app
+   `prometheus_client.CollectorRegistry` — never persist them (add no disk or
+   external state): Prometheus `rate()`/`increase()`/`histogram_quantile()`
+   handle restarts by design. `GET /metrics` is **unauthenticated** (v1) and
+   exposes config values plus traffic stats, so it must be network-protected
+   like vLLM's own `/metrics`. Two model namespaces must not be conflated:
+   `model` is the request body's `model` field (the future routing key) while
+   `model_name` is vLLM's served-model label — different strings, different
+   label names, different metrics. And recording is a **pure side effect**:
+   `record_*` must never change the decision, the 429, or the proxy path, and
+   `/metrics` always returns 200 (never 429/404). (`stats.py`, `app.py`)
+
 ## Authoritative docs (read on demand)
 
 - `README.md` — quickstart, config reference, decision logic, 429 contract,
-  operational notes, v2 roadmap.
+  observability (`/metrics` reference, PromQL, scrape config), operational
+  notes, v2 roadmap.
+- `docs/plans/observability.md` — the observability/stats design plan (metric
+  table, two-model-namespaces rationale, median-as-histogram semantics).
 - `config.example.yaml` — the reference configuration with the `thresholds`
   entry contract.
 - `AGENTS.md` (this file) — architecture map, test commands, git workflow, and

@@ -215,11 +215,88 @@ Content-Type: application/json
 | `POST /v1/chat/completions` | Gated, then proxied to vLLM (SSE streaming supported). |
 | `POST /v1/completions` | Gated, then proxied to vLLM. |
 | `GET /healthz` | Liveness (always 200; readiness info in body). |
+| `GET /metrics` | Gate-local Prometheus stats (see [Observability](#observability)); **not** proxied. |
 | anything else | `404`. |
 
 The proxy forwards method, path, query, headers (minus hop-by-hop), and body
 verbatim, and propagates upstream status codes — a vLLM 5xx surfaces as a 5xx,
 never masked by the gate.
+
+---
+
+## Observability
+
+The gate exposes its own stats at `GET /metrics` — HTTP 200 with
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`, body in the
+Prometheus text exposition format (the same shape vLLM emits). It is a
+gate-local endpoint like `/healthz`, **not proxied** — do not confuse the two:
+the background poller scrapes **vLLM's** `/metrics` (on vLLM's port), while the
+gate's `GET /metrics` (on the gate's port) serves the gate's own `gate_*`
+metrics. They are different endpoints and different Prometheus scrape targets.
+
+- **In-memory only, resets on restart.** All `gate_*` metrics live in memory
+  and reset when the process restarts. That is by design: Prometheus
+  `rate()`, `increase()`, and `histogram_quantile()` all handle counter resets
+  correctly, so no persistence is added.
+- **Unauthenticated (v1).** Consistent with the no-auth invariant. The
+  endpoint exposes the loaded config values and traffic stats, so
+  network-protect it the same way you already protect vLLM's own `/metrics`.
+- **Decision path unchanged.** Recording is a pure side effect of each
+  allow/reject decision — it never alters the decision, the 429 response, or
+  the proxy.
+
+### Metric reference
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `gate_requests_total` | Counter | `endpoint` (`chat_completions` \| `completions`), `model` (the request body's `model` field, else `unknown`), `result` (`forwarded` \| `rejected`) | Generation requests the gate decided, scoped to the two generation endpoints (404s, `/healthz`, and `/metrics` are not counted). |
+| `gate_request_ctx_tokens` | Histogram | `model`, `result` | Estimated context tokens (prompt + headroom) of each request. Median via `histogram_quantile(0.5, ...)`. Buckets: 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144. |
+| `gate_kv_cache_usage_pct` | Gauge | `model_name` (vLLM's `model_name` label; `default` when the series is unlabeled) | Current KV-cache fill **percentage (0–100)** per served model. |
+| `gate_config_info` | Info | one label per config field + `thresholds_json` | The loaded configuration, set once at startup. |
+| `gate_metrics_fresh` | Gauge | (none) | `1` if the vLLM metrics feed is fresh, `0` if stale or never fetched. |
+| `gate_metrics_age_s` | Gauge | (none) | Seconds since the last successful vLLM `/metrics` fetch; `NaN` if never fetched. |
+
+**Two model namespaces, kept distinct.** `model` is the OpenAI request body's
+`model` field (the client's model name — the future multi-server routing key).
+`model_name` is vLLM's served-model label. They are different strings on
+different metrics with different label names; do not conflate them in queries
+or dashboards.
+
+### PromQL examples
+
+```promql
+# total requests processed (rate over 5m)
+sum(rate(gate_requests_total[5m]))
+# forwarded vs rejected rates
+sum(rate(gate_requests_total{result="forwarded"}[5m]))
+sum(rate(gate_requests_total{result="rejected"}[5m]))
+# reject rate (fraction of requests the gate rejected)
+sum(rate(gate_requests_total{result="rejected"}[5m])) / sum(rate(gate_requests_total[5m]))
+# median size (estimated tokens) of forwarded / rejected requests
+histogram_quantile(0.5, sum by (model) (gate_request_ctx_tokens_bucket{result="forwarded"}))
+histogram_quantile(0.5, sum by (model) (gate_request_ctx_tokens_bucket{result="rejected"}))
+# current per-model KV-cache fill %
+gate_kv_cache_usage_pct
+# is the upstream metrics feed healthy?
+gate_metrics_fresh
+```
+
+> **Median is derived, not exposed.** The gate exposes a histogram;
+> `histogram_quantile` interpolates at bucket resolution. A histogram `_count`
+> counts only requests that had a token estimate (fail-open unparseable
+> requests are skipped), so it can be lower than
+> `gate_requests_total{result=...}` for the same labels — expected.
+
+### Prometheus scrape config
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: vllm-gate
+    static_configs:
+      - targets: ["gate:8000"]   # the gate's own /metrics
+  # vLLM's own /metrics is a separate scrape target (e.g. job_name: vllm).
+```
 
 ---
 
@@ -238,6 +315,11 @@ never masked by the gate.
 - **Logging.** Structured `logging` at INFO; one line per decision
   (`usage_pct`, `ctx_tokens`, `active_tier`, `allow/reject`, `retry_after`).
   Prompt text is never logged.
+- **Observability.** The gate exposes its own stats at `GET /metrics`
+  (Prometheus text format) — forwarded/rejected counts, request-size
+  histograms, per-model KV-cache fill, loaded config, and feed freshness. See
+  the [Observability](#observability) section for the metric reference and
+  ready-to-paste PromQL.
 
 ---
 

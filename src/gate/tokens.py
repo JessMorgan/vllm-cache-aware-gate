@@ -126,3 +126,31 @@ def estimate_context_tokens(body: bytes, cfg: GateConfig) -> int | None:
     # Exact integer ceiling (prompt_chars >= 0): no float rounding, no
     # OverflowError for astronomically large values.
     return -(-prompt_chars // cfg.chars_per_token) + _headroom(data, cfg)
+
+
+def extract_request_model(body: bytes) -> str:
+    """Extract the request's ``model`` field for stats labeling.
+
+    Pure and defensive: never raises. Returns the request's ``model`` string
+    (the original, unstripped value) when the body is valid UTF-8 JSON with a
+    non-empty string ``model`` field; otherwise returns ``"unknown"``.
+
+    The result is used only as a stats label (the future multi-server routing
+    key) — never for the gate's forward/reject decision.
+    """
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return "unknown"
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, RecursionError):
+        # RecursionError: the C JSON parser rejects pathologically nested
+        # input with it; that is an unparseable body.
+        return "unknown"
+    if not isinstance(data, dict):
+        return "unknown"
+    model = data.get("model")
+    if isinstance(model, str) and model.strip() != "":
+        return model
+    return "unknown"

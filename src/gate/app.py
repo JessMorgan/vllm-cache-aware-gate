@@ -18,6 +18,11 @@ Invariants (see AGENTS.md "Known gotchas"):
 - A 429 uses the governing tier's ``timeout_s`` as ``Retry-After`` (gotcha #3).
 - Upstream status is propagated unmasked and ``stream: true`` SSE is not
   buffered (gotcha #6).
+
+The app also exposes ``GET /metrics``, a Prometheus endpoint serving in-memory
+``gate_*`` stats from :mod:`gate.stats`. Each allow/reject decision is recorded
+into the stats layer as a pure side effect — recording never alters the
+decision.
 """
 
 from __future__ import annotations
@@ -37,13 +42,17 @@ from gate.metrics import MetricsCache
 from gate.poller import run_poller
 from gate.proxy import proxy_request
 from gate.router import Decision, decision
-from gate.tokens import estimate_context_tokens
+from gate.stats import GateStats
+from gate.tokens import estimate_context_tokens, extract_request_model
 
 log = logging.getLogger("gate.app")
 
 # Shared upstream client timeout: connect fast, no read timeout (SSE streams
 # can be long-lived), bounded write/pool.
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
+
+# Content type for the Prometheus text exposition format (version 0.0.4).
+_METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 
 def _is_streaming(body: bytes) -> bool:
@@ -86,6 +95,7 @@ def create_app(
     cache: MetricsCache | None = None,
     upstream: httpx.AsyncClient | None = None,
     start_poller: bool = True,
+    stats: GateStats | None = None,
 ) -> FastAPI:
     """Build the gate FastAPI app.
 
@@ -96,6 +106,8 @@ def create_app(
             a fresh one is created when None.
         start_poller: When True the poller task is started in the lifespan.
             Tests pass False so the poller does not interfere.
+        stats: A :class:`GateStats` for the ``/metrics`` endpoint; a fresh one
+            is created when None.
 
     The poller is started by the lifespan (which uvicorn / TestClient trigger),
     so :func:`gate.main.main` does not start it separately.
@@ -104,6 +116,8 @@ def create_app(
         cache = MetricsCache()
     if upstream is None:
         upstream = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
+    if stats is None:
+        stats = GateStats(cfg)
     base_url = f"http://{cfg.vllm_host}:{cfg.vllm_port}"
 
     @asynccontextmanager
@@ -131,9 +145,11 @@ def create_app(
     app.state.cache = cache
     app.state.upstream = upstream
     app.state.base_url = base_url
+    app.state.stats = stats
 
-    async def _handle_generation(request: Request) -> Response:
+    async def _handle_generation(request: Request, endpoint: str) -> Response:
         body = await request.body()
+        model = extract_request_model(body)
         ctx_tokens = estimate_context_tokens(body, cfg)
 
         frac = cache.value()
@@ -145,6 +161,10 @@ def create_app(
         dec = decision(usage_pct, ctx_tokens, cfg.thresholds)
 
         if dec.allow:
+            try:
+                stats.record_forwarded(endpoint, model, ctx_tokens)
+            except Exception:  # noqa: BLE001 - stats must never break the request path
+                log.warning("stats.record_forwarded failed", exc_info=True)
             is_stream = _is_streaming(body)
             log.debug(
                 "allow reason=%s usage_pct=%s ctx_tokens=%s stream=%s",
@@ -162,6 +182,10 @@ def create_app(
             ctx_tokens,
             dec.retry_after,
         )
+        try:
+            stats.record_rejected(endpoint, model, ctx_tokens)
+        except Exception:  # noqa: BLE001 - stats must never break the request path
+            log.warning("stats.record_rejected failed", exc_info=True)
         return JSONResponse(
             status_code=429,
             headers={"Retry-After": str(dec.retry_after)},
@@ -176,11 +200,11 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
-        return await _handle_generation(request)
+        return await _handle_generation(request, "chat_completions")
 
     @app.post("/v1/completions")
     async def completions(request: Request) -> Response:
-        return await _handle_generation(request)
+        return await _handle_generation(request, "completions")
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -192,5 +216,11 @@ def create_app(
                 "kv_usage": cache.value(),
             },
         )
+
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        stats.set_kv_usage(cache.by_model())
+        stats.set_freshness(not cache.is_stale(cfg.stale_after_s), cache.age())
+        return Response(content=stats.render(), media_type=_METRICS_CONTENT_TYPE)
 
     return app
