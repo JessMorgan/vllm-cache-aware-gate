@@ -30,6 +30,10 @@ _KNOWN_KEYS: frozenset[str] = frozenset(
         "chars_per_token",
         "default_max_tokens",
         "thresholds",
+        "target_kv_cache_pct",
+        "retry_min_s",
+        "retry_max_s",
+        "token_margin",
     }
 )
 
@@ -66,6 +70,10 @@ class GateConfig:
     chars_per_token: int = 4
     default_max_tokens: int = 256
     thresholds: tuple[Threshold, ...] = ()
+    target_kv_cache_pct: float = 85.0
+    retry_min_s: int = 5
+    retry_max_s: int = 60
+    token_margin: float = 1.25
 
 
 def _is_int(value: Any) -> bool:
@@ -150,6 +158,16 @@ def _merge_file(data: GateConfig, raw: dict[str, Any], source: str) -> GateConfi
             updates[key] = float(raw[key])
     if "thresholds" in raw:
         updates["thresholds"] = tuple(_parse_thresholds(raw["thresholds"], source))
+    for key in ("retry_min_s", "retry_max_s"):
+        if key in raw:
+            if not _is_int(raw[key]):
+                raise ConfigError(f"{source}: '{key}' must be an integer")
+            updates[key] = raw[key]
+    for key in ("target_kv_cache_pct", "token_margin"):
+        if key in raw:
+            if not _is_number(raw[key]):
+                raise ConfigError(f"{source}: '{key}' must be a number")
+            updates[key] = float(raw[key])
     return replace(data, **updates)
 
 
@@ -162,6 +180,17 @@ def _parse_env_int(env: Mapping[str, str], name: str) -> int | None:
         return int(value)
     except ValueError:
         raise ConfigError(f"environment variable {name}={value!r} is not a valid integer") from None
+
+
+def _parse_env_float(env: Mapping[str, str], name: str) -> float | None:
+    """Parse an env var as a float; None if unset, ConfigError if malformed."""
+    value = env.get(name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise ConfigError(f"environment variable {name}={value!r} is not a valid number") from None
 
 
 def _apply_env(data: GateConfig, env: Mapping[str, str]) -> GateConfig:
@@ -186,13 +215,25 @@ def _apply_env(data: GateConfig, env: Mapping[str, str]) -> GateConfig:
         except json.JSONDecodeError as e:
             raise ConfigError(f"THRESHOLDS_JSON is not valid JSON: {e}") from e
         updates["thresholds"] = tuple(_parse_thresholds(raw, "THRESHOLDS_JSON"))
+    retry_min_s = _parse_env_int(env, "RETRY_MIN_S")
+    if retry_min_s is not None:
+        updates["retry_min_s"] = retry_min_s
+    retry_max_s = _parse_env_int(env, "RETRY_MAX_S")
+    if retry_max_s is not None:
+        updates["retry_max_s"] = retry_max_s
+    target_kv_cache_pct = _parse_env_float(env, "TARGET_KV_CACHE_PCT")
+    if target_kv_cache_pct is not None:
+        updates["target_kv_cache_pct"] = target_kv_cache_pct
+    token_margin = _parse_env_float(env, "TOKEN_MARGIN")
+    if token_margin is not None:
+        updates["token_margin"] = token_margin
     return replace(data, **updates)
 
 
 def _validate(data: GateConfig) -> None:
     """Validate the final config; raise ConfigError on any violation."""
-    if len(data.thresholds) < 1:
-        raise ConfigError("at least one threshold entry is required")
+    # thresholds are optional: an empty/absent tiered policy just means the
+    # tiered layer always allows (zero-config is valid).
     seen_kv: set[float] = set()
     for i, t in enumerate(data.thresholds):
         where = f"thresholds[{i}]"
@@ -220,6 +261,20 @@ def _validate(data: GateConfig) -> None:
         )
     if not math.isfinite(data.stale_after_s) or data.stale_after_s <= 0:
         raise ConfigError(f"stale_after_s must be a finite number > 0, got {data.stale_after_s}")
+    if not math.isfinite(data.target_kv_cache_pct) or not 0 < data.target_kv_cache_pct <= 100:
+        raise ConfigError(
+            f"target_kv_cache_pct must be a finite number in (0, 100], "
+            f"got {data.target_kv_cache_pct}"
+        )
+    if not _is_int(data.retry_min_s) or data.retry_min_s < 1:
+        raise ConfigError(f"retry_min_s must be an integer >= 1, got {data.retry_min_s}")
+    if not _is_int(data.retry_max_s) or data.retry_max_s < data.retry_min_s:
+        raise ConfigError(
+            f"retry_max_s must be an integer >= retry_min_s ({data.retry_min_s}), "
+            f"got {data.retry_max_s}"
+        )
+    if not math.isfinite(data.token_margin) or data.token_margin < 1.0:
+        raise ConfigError(f"token_margin must be a finite number >= 1.0, got {data.token_margin}")
 
 
 def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -> GateConfig:
