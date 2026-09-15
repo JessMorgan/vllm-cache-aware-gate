@@ -44,6 +44,11 @@ FastAPI app wires together.
   overrides, then validates strictly. `kv_pct` is a **percentage (0–100)**;
   the vLLM metric is a **fraction (0–1)**. The `THRESHOLDS_JSON` env override
   is still parsed as JSON (a JSON list), even though the file is YAML.
+  `thresholds` is **optional** (zero-config is valid; an empty/absent tiered
+  policy just means the tiered layer always allows). Also carries the four
+  autoconfig knobs with defaults + env overrides: `target_kv_cache_pct`
+  (`85.0`, `TARGET_KV_CACHE_PCT`), `retry_min_s` (`5`, `RETRY_MIN_S`),
+  `retry_max_s` (`60`, `RETRY_MAX_S`), `token_margin` (`1.25`, `TOKEN_MARGIN`).
 - **`src/gate/tokens.py`** — `estimate_context_tokens(body, cfg) -> int |
   None`. Pure. Estimates prompt tokens as `ceil(prompt_chars / chars_per_token)`
   plus `max_tokens` headroom (default 256); returns `None` on an
@@ -55,16 +60,38 @@ FastAPI app wires together.
 - **`src/gate/metrics.py`** — `parse_kv_cache_usage(text) -> float | None`
   (max across all `vllm:kv_cache_usage_perc` series),
   `parse_kv_cache_usage_by_model(text) -> dict[str, float] | None` (per-model
-  fractions keyed by `model_name`, `"default"` when unlabeled), and
-  `MetricsCache` (last value + `fetched_at` + `age()`; `by_model()` stores the
-  per-model breakdown while `_value` stays the MAX of it).
-- **`src/gate/poller.py`** — `run_poller(...)`: async background task that fetches
-  `http://VLLM_HOST:VLLM_PORT/metrics` every `metrics_poll_interval_s`, updates the
-  cache with the per-model breakdown (`fetch_usage_by_model` / `update_by_model`),
-  and **fails open** on error (keeps last value; no crash).
+  fractions keyed by `model_name`, `"default"` when unlabeled),
+  `parse_kv_cache_capacity(text) -> int | None` (max positive
+  `vllm:kv_cache_size_tokens` sample), and `fetch_metrics(client, url) ->
+  MetricsSample` (a single GET that parses usage + by-model + capacity from one
+  body). `MetricsCache` (last value + `fetched_at` + `age()`; `by_model()`
+  stores the per-model breakdown while `_value` stays the MAX of it),
+  `CapacityCache` (last good capacity token count; never stale, only unknown),
+  `CapacityUnavailableError` (raised by the poller on an observed body missing
+  the capacity gauge), and `KvRemaining` — the in-memory estimated-remaining-KV
+  counter (`reanchor(tokens)` resets, `subtract(tokens)` is unclamped and a
+  no-op when never anchored, `value()` returns `int | None`).
+- **`src/gate/poller.py`** — `run_poller(client, cache, url, interval_s, *,
+  counter, target_frac, capacity_cache)`: async background task that makes ONE
+  `GET` per tick via `fetch_metrics` and, on an observed (HTTP 200) body,
+  updates the usage + per-model caches, **re-anchors the `KvRemaining` counter**
+  to `anchor_remaining_tokens(capacity, target_frac, usage_frac)`, and updates
+  the `CapacityCache`. **Fails open** on any transport error / non-200 (keeps
+  ALL state — caches and counter — no crash). **Fails closed (unconditional):**
+  an observed body missing a usable `vllm:kv_cache_size_tokens` gauge raises
+  `CapacityUnavailableError` (the app's fatal callback exits the process).
 - **`src/gate/router.py`** — `decision(usage_pct, ctx_tokens, thresholds) ->
-  Decision`. Pure. The heart of the gate: highest-tier-only selection +
-  inclusive `ctx_tokens <= max_context` comparison.
+  Decision`. Pure. The heart of the tiered gate: highest-tier-only selection +
+  inclusive `ctx_tokens <= max_context` comparison. Also the always-on
+  autoconfig layer (all pure, fraction/token space): `AutoPolicy(token_margin,
+  retry_min_s, retry_max_s)`, `decision_auto(remaining_tokens, ctx_tokens,
+  policy) -> Decision` (admits when `ceil(ctx × token_margin) <= remaining`,
+  inclusive), `anchor_remaining_tokens(capacity, target_frac, usage_frac) ->
+  int` (`floor(capacity × max(target_frac − clamp(usage,0,1), 0))`),
+  `scaled_retry_after(effective, remaining, min_s, max_s) -> int` (integer in
+  `[min_s, max_s]`; `remaining <= 0` → `max_s`), and
+  `combine_decisions(tier, auto) -> Decision` (AND; both-reject → max timeout,
+  tie → tiered).
 - **`src/gate/proxy.py`** — `proxy_request(httpx, request) -> Response`.
   Transparent forward of method/path/query/headers/body; streams SSE verbatim;
   strips hop-by-hop headers; propagates upstream status (does not mask 5xx).
@@ -73,14 +100,27 @@ FastAPI app wires together.
   `gate_*` metric objects, and `render()` (Prometheus text exposition for
   `GET /metrics`). In-memory only; resets on restart by design.
   `record_forwarded/rejected`, `set_kv_usage` (fraction→percent, removes stale
-  model series), `set_freshness`.
+  model series), `set_freshness`, and `set_remaining(int | None)` (the
+  `gate_kv_cache_remaining_tokens` gauge — the gate's own live estimate of
+  remaining KV tokens; `None` renders `NaN`).
 - **`src/gate/app.py`** — Builds the FastAPI app: routes
   (`POST /v1/chat/completions`, `POST /v1/completions`, `GET /healthz`,
   `GET /metrics`), the 429 builder, and wiring of poller + cache + proxy +
   stats (each decision is recorded as a pure side effect; `/metrics` renders
-  the stats and always returns 200).
-- **`src/gate/main.py`** — `main()` entrypoint: load config, start the poller as a
-  background task, run uvicorn; graceful shutdown.
+  the stats and always returns 200). Owns the `KvRemaining` counter and
+  `CapacityCache`; applies the **staleness gate** (stale/never-fetched feed →
+  both layers fail open regardless of the counter), AND-combines the tiered and
+  autoconfig decisions via `combine_decisions`, charges the counter
+  (`counter.subtract(ceil(ctx × margin) or 0)`) on every forward **before** the
+  proxy await, builds the rejector-aware 429 (combined `Retry-After`, tiered vs
+  autoconfig message text), and exits 1 (`os._exit(1)`) via the poller's fatal
+  done-callback. `GET /healthz` adds `kv_cache_capacity_tokens` +
+  `kv_cache_remaining_tokens`.
+- **`src/gate/main.py`** — `main()` entrypoint: load config, log the autoconfig
+  knobs (`target %s%% KV cache, token margin %s, retry %d-%ds`) and the tiered
+  tier count (`N threshold tier(s)` or `none — autoconfig only`), build the app
+  (the poller is started by the app lifespan, not here), and run uvicorn. There
+  is **no CLI** — argv is ignored (autoconfig is always on).
 - **`tests/`** — `test_tokens.py`, `test_router.py`, `test_metrics.py`,
   `test_stats.py`, `test_api.py` (ASGI end-to-end with a fake vLLM),
   `test_poller.py`.
@@ -468,6 +508,51 @@ proxy, not an inference engine.
    `record_*` must never change the decision, the 429, or the proxy path, and
    `/metrics` always returns 200 (never 429/404). (`stats.py`, `app.py`)
 
+10. **Unconditional fail-closed on a missing capacity gauge — but fail-open
+    while unreachable/stale.** The poller raises `CapacityUnavailableError`
+    (and the app exits 1) **only** when an *observed* (HTTP 200) `/metrics` body
+    lacks a usable `vllm:kv_cache_size_tokens` gauge — a live vLLM that cannot
+    anchor the counter. A merely unreachable, erroring, or stale feed is **never
+    fatal**: it keeps all state and the app fails open via staleness (gotcha #1
+    outranks the counter — a metrics outage never blocks traffic). Do not
+    "helpfully" make the unreachable path fatal, and do not gate the fatal path
+    behind a flag: autoconfig is always on. (`poller.py`, `app.py`,
+    `metrics.py`)
+
+11. **Remaining-KV counter semantics.** `KvRemaining` is **re-anchored (reset,
+    not additive)** on every good poll to
+    `anchor_remaining_tokens(capacity, target_frac, usage_frac)`; it is
+    **subtracted only on forwarded requests**, charging `ceil(ctx ×
+    token_margin)` (`0` when `ctx` is unknown); subtraction is **unclamped** (the
+    value may go negative — an over-committed signal); and **rejected requests
+    charge nothing**. Subtraction happens on every forward even while the feed
+    is stale (bookkeeping continues), but the *decision* fails open during
+    staleness, so the counter cannot reject then. (`metrics.py`, `app.py`,
+    `router.py`)
+
+12. **Two admission layers are AND-combined; the rejector is the
+    max-timeout one.** A request forwards only if the tiered layer **and** the
+    autoconfig layer both allow (no tiers ⇒ tiered always allows). When both
+    reject, `Retry-After = max(tier timeout, autoconfig retry)` and the
+    **reported rejector** is the layer with the higher timeout (**tie →
+    tiered**); the 429 message names the reported rejector. Do not OR the
+    layers or pick the lower timeout. (`router.py`, `app.py`)
+
+13. **Zero-config operation.** `thresholds` is **optional** — the gate runs
+    with only the vLLM host/port (no config file, no flags, **no CLI**; argv is
+    ignored, so a legacy `--auto` is a harmless no-op). The four autoconfig
+    knobs (`target_kv_cache_pct` 85.0, `retry_min_s` 5, `retry_max_s` 60,
+    `token_margin` 1.25) all have sane defaults. Do not reintroduce a
+    "≥1 threshold" requirement or a mode/enablement switch. (`config.py`,
+    `main.py`)
+
+14. **The single percentage→fraction conversion is `target_kv_cache_pct /
+    100.0` at poller start.** The autoconfig path (`anchor_remaining_tokens`,
+    `decision_auto`, `scaled_retry_after`) works in **fraction (0–1) and token
+    space** and never sees a percentage. Gotcha #2 still applies to the *tiered*
+    path (`usage_frac * 100.0 >= kv_pct`); do not conflate the two conversions.
+    (`app.py`, `router.py`)
+
 ## Authoritative docs (read on demand)
 
 - `README.md` — quickstart, config reference, decision logic, 429 contract,
@@ -475,6 +560,9 @@ proxy, not an inference engine.
   notes, v2 roadmap.
 - `docs/plans/observability.md` — the observability/stats design plan (metric
   table, two-model-namespaces rationale, median-as-histogram semantics).
+- `docs/plans/autoconfig.md` — the autoconfig (always-on KV admission) design
+  plan: the two AND-combined admission layers, the remaining-KV counter, the
+  staleness gate, retry scaling, the combination rule, and the worked example.
 - `config.example.yaml` — the reference configuration with the `thresholds`
   entry contract.
 - `AGENTS.md` (this file) — architecture map, test commands, git workflow, and

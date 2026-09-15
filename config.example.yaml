@@ -2,8 +2,8 @@
 #
 # The gate reads /etc/gate/config.yaml by default; mount this file there (or
 # pass an explicit path to load_config). All keys are optional; defaults fill
-# any that are absent. The only hard requirement is at least one thresholds
-# entry.
+# any that are absent. The gate runs with zero configuration (only the vLLM
+# host/port is required) — autoconfig is always on.
 #
 # NOTE: kv_pct is a percentage (0-100). The vLLM metric is a fraction (0-1);
 # the gate multiplies it by 100 before comparing.
@@ -16,8 +16,10 @@ stale_after_s: 6.0
 chars_per_token: 4
 default_max_tokens: 256
 
-# Tiered policy, highest tier only: when usage crosses several thresholds the
-# one with the largest kv_pct governs.
+# Tiered policy — OPTIONAL (env override: THRESHOLDS_JSON, a JSON list).
+# Highest tier only: when usage crosses several thresholds the one with the
+# largest kv_pct governs. With no tiers the tiered layer always allows; the
+# always-on autoconfig layer below still gates every request.
 thresholds:
   - kv_pct: 50
     max_context: 4096
@@ -25,3 +27,17 @@ thresholds:
   - kv_pct: 80
     max_context: 1024
     timeout_s: 30
+
+# Autoconfig (always on) — all optional, defaults shown.
+# target_kv_cache_pct: target KV-cache percentage (0-100) the remaining-KV
+#   counter anchors headroom up to. Finite, (0, 100].
+#   (env override: TARGET_KV_CACHE_PCT)
+target_kv_cache_pct: 85.0
+# retry_min_s / retry_max_s: bounds on the autoconfig 429 Retry-After (seconds).
+#   retry_min_s >= 1; retry_max_s >= retry_min_s.
+#   (env overrides: RETRY_MIN_S, RETRY_MAX_S)
+retry_min_s: 5
+retry_max_s: 60
+# token_margin: conservatism multiplier on the estimated context tokens.
+#   Finite, >= 1.0. (env override: TOKEN_MARGIN)
+token_margin: 1.25
