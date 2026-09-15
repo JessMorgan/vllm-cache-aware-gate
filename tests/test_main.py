@@ -2,12 +2,15 @@
 
 Covers the wiring contract of ``main()``: a ``ConfigError`` exits non-zero,
 the happy path builds the app via ``create_app`` with ``start_poller=True``
-and hands it to ``uvicorn.run`` with the configured listen host/port, and the
-``LOG_LEVEL`` env var is forwarded to uvicorn. Uvicorn itself is recorded, not
-run.
+and hands it to ``uvicorn.run`` with the configured listen host/port, the
+``LOG_LEVEL`` env var is forwarded to uvicorn, and the startup INFO log
+reports the autoconfig knobs and the tiered tier count (or the none case).
+Uvicorn itself is recorded, not run.
 """
 
 from __future__ import annotations
+
+import logging
 
 import pytest
 
@@ -129,3 +132,44 @@ def test_log_level_defaults_to_info(monkeypatch: pytest.MonkeyPatch) -> None:
     main_mod.main()
 
     assert run_calls[0]["log_level"] == "info"
+
+
+def _stub_uvicorn_and_deps(monkeypatch: pytest.MonkeyPatch, cfg: GateConfig) -> None:
+    """Monkeypatch load_config/create_app/AsyncClient/uvicorn.run so main()
+    runs to completion without touching the network."""
+    monkeypatch.setattr(main_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(main_mod, "create_app", lambda _cfg, **_kw: object())
+    monkeypatch.setattr(main_mod.httpx, "AsyncClient", lambda **_kw: object())
+    monkeypatch.setattr(main_mod.uvicorn, "run", lambda _app, **_kw: None)
+
+
+def test_startup_logs_autoconfig_knobs_and_no_tiers(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A zero-config (no thresholds) startup logs the autoconfig knobs and
+    the 'none — autoconfig only' tier line at INFO."""
+    cfg = GateConfig(vllm_host="vllm", vllm_port=9000)
+    _stub_uvicorn_and_deps(monkeypatch, cfg)
+
+    with caplog.at_level(logging.INFO, logger="gate.main"):
+        main_mod.main()
+
+    messages = [r.message for r in caplog.records if r.name == "gate.main"]
+    assert "autoconfig: target 85.0% KV cache, token margin 1.25, retry 5-60s" in messages
+    assert "tiered policy: none — autoconfig only" in messages
+    assert all(r.levelno == logging.INFO for r in caplog.records if r.name == "gate.main")
+
+
+def test_startup_logs_tier_count(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A config with N thresholds logs the N-tier line at INFO."""
+    cfg = make_cfg()  # two thresholds
+    _stub_uvicorn_and_deps(monkeypatch, cfg)
+
+    with caplog.at_level(logging.INFO, logger="gate.main"):
+        main_mod.main()
+
+    messages = [r.message for r in caplog.records if r.name == "gate.main"]
+    assert "autoconfig: target 85.0% KV cache, token margin 1.25, retry 5-60s" in messages
+    assert "tiered policy: 2 threshold tier(s)" in messages
