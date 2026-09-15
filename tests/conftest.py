@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
+import yaml
 
 SAMPLE_CONFIG: dict = {
     "vllm_host": "vllm",
@@ -25,12 +24,12 @@ SAMPLE_CONFIG: dict = {
 @pytest.fixture
 def sample_config_dict() -> dict:
     """A valid config dict with two thresholds."""
-    return json.loads(json.dumps(SAMPLE_CONFIG))
+    return yaml.safe_load(yaml.safe_dump(SAMPLE_CONFIG))
 
 
 @pytest.fixture
 def tmp_config_file(tmp_path, sample_config_dict) -> str:
     """Write the sample config to a temp file and yield its path."""
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(sample_config_dict), encoding="utf-8")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(sample_config_dict), encoding="utf-8")
     return str(path)

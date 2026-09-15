@@ -1,8 +1,8 @@
 """Configuration loading and validation for the gate.
 
-Pure, stdlib-only. Reads a JSON config file (if any) and applies environment
-overrides, then validates the result. All failures raise :class:`ConfigError`
-with a clear message so startup fails fast.
+Reads a YAML config file (if any) and applies environment overrides, then
+validates the result. All failures raise :class:`ConfigError` with a clear
+message so startup fails fast.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-DEFAULT_CONFIG_PATH = "/etc/gate/config.json"
+import yaml
+
+DEFAULT_CONFIG_PATH = "/etc/gate/config.yaml"
 
 # Known top-level config keys, mapped to the GateConfig field they populate.
 _KNOWN_KEYS: frozenset[str] = frozenset(
@@ -77,7 +79,7 @@ def _is_number(value: Any) -> bool:
 
 
 def _parse_thresholds(raw: Any, source: str) -> list[Threshold]:
-    """Parse a JSON ``thresholds`` value into a list of Thresholds."""
+    """Parse a ``thresholds`` value (list of objects) into Thresholds."""
     if not isinstance(raw, list):
         raise ConfigError(f"{source}: 'thresholds' must be a list of objects")
     parsed: list[Threshold] = []
@@ -105,25 +107,25 @@ def _parse_thresholds(raw: Any, source: str) -> list[Threshold]:
 
 
 def _load_file(path: str) -> dict[str, Any]:
-    """Read and parse a JSON config file; raise ConfigError on any problem."""
+    """Read and parse a YAML config file; raise ConfigError on any problem."""
     if not os.path.isfile(path):
         raise ConfigError(f"config file not found: {path}")
     try:
         with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except json.JSONDecodeError as e:
-        raise ConfigError(f"config file {path} is not valid JSON: {e}") from e
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"config file {path} is not valid YAML: {e}") from e
     except UnicodeDecodeError as e:
         raise ConfigError(f"config file {path} is not valid UTF-8 text: {e}") from e
     except OSError as e:
         raise ConfigError(f"could not read config file {path}: {e}") from e
     if not isinstance(raw, dict):
-        raise ConfigError(f"config file {path} must contain a JSON object")
+        raise ConfigError(f"config file {path} must contain a YAML mapping")
     return raw
 
 
 def _merge_file(data: GateConfig, raw: dict[str, Any], source: str) -> GateConfig:
-    """Merge known keys from a parsed JSON object over the defaults."""
+    """Merge known keys from a parsed config mapping over the defaults."""
     unknown = set(raw) - _KNOWN_KEYS
     if unknown:
         raise ConfigError(f"{source}: unknown config key(s): {sorted(unknown)}")
@@ -225,7 +227,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
 
     Precedence (lowest to highest): defaults < config file < environment.
 
-    - ``path``: explicit config file; must exist and be valid JSON.
+    - ``path``: explicit config file; must exist and be valid YAML.
     - ``path is None``: use ``DEFAULT_CONFIG_PATH`` if it exists, else defaults.
     - ``env``: overrides applied last; defaults to ``os.environ``.
 

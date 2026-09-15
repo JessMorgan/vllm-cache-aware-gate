@@ -5,14 +5,15 @@ from __future__ import annotations
 import json
 
 import pytest
+import yaml
 
 from gate import config
 from gate.config import ConfigError, GateConfig, Threshold, load_config
 
 
-def _write(tmp_path, data: object, name: str = "config.json") -> str:
+def _write(tmp_path, data: object, name: str = "config.yaml") -> str:
     p = tmp_path / name
-    p.write_text(json.dumps(data), encoding="utf-8")
+    p.write_text(yaml.safe_dump(data), encoding="utf-8")
     return str(p)
 
 
@@ -64,7 +65,7 @@ def test_env_overrides_win_over_file(tmp_config_file):
 
 def test_no_file_no_env_defaults_are_invalid(tmp_path, monkeypatch):
     """Defaults have zero thresholds, which is invalid: must raise ConfigError."""
-    monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.json"))
+    monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.yaml"))
     with pytest.raises(ConfigError, match="at least one threshold"):
         load_config(path=None, env={})
 
@@ -98,13 +99,13 @@ def test_valid_multi_threshold_config_is_tuple():
 
 def test_bad_file_path_raises(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
-        load_config(path=str(tmp_path / "missing.json"), env={})
+        load_config(path=str(tmp_path / "missing.yaml"), env={})
 
 
-def test_invalid_json_file_raises(tmp_path):
-    p = tmp_path / "bad.json"
-    p.write_text("{not json", encoding="utf-8")
-    with pytest.raises(ConfigError, match="not valid JSON"):
+def test_invalid_yaml_file_raises(tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text("key: [unterminated", encoding="utf-8")
+    with pytest.raises(ConfigError, match="not valid YAML"):
         load_config(path=str(p), env={})
 
 
@@ -120,10 +121,10 @@ def test_unknown_top_level_key_raises(tmp_path):
         load_config(path=path, env={})
 
 
-def test_file_must_be_json_object(tmp_path):
-    p = tmp_path / "list.json"
-    p.write_text("[1, 2, 3]", encoding="utf-8")
-    with pytest.raises(ConfigError, match="must contain a JSON object"):
+def test_file_must_be_yaml_mapping(tmp_path):
+    p = tmp_path / "list.yaml"
+    p.write_text("- 1\n- 2\n- 3\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="must contain a YAML mapping"):
         load_config(path=str(p), env={})
 
 
@@ -318,15 +319,14 @@ def test_kv_pct_accepts_float():
 
 
 def test_nan_poll_interval_raises(tmp_path):
-    """NaN is valid JSON but must be rejected by the > 0 validation."""
-    p = tmp_path / "nan.json"
+    """NaN is representable in YAML (.nan) but must be rejected by > 0."""
+    p = tmp_path / "nan.yaml"
     p.write_text(
-        json.dumps(
-            {
-                "metrics_poll_interval_s": float("nan"),
-                "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
-            }
-        ),
+        "metrics_poll_interval_s: .nan\n"
+        "thresholds:\n"
+        "  - kv_pct: 50\n"
+        "    max_context: 1\n"
+        "    timeout_s: 1\n",
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="metrics_poll_interval_s"):
@@ -334,7 +334,7 @@ def test_nan_poll_interval_raises(tmp_path):
 
 
 def test_non_utf8_file_raises(tmp_path):
-    p = tmp_path / "binary.json"
+    p = tmp_path / "binary.yaml"
     p.write_bytes(b"\xff\xfe\x00garbage")
     with pytest.raises(ConfigError, match="not valid UTF-8"):
         load_config(path=str(p), env={})

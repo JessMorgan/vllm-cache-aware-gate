@@ -121,27 +121,31 @@ curl http://localhost:8000/healthz
 
 ## Configuration
 
-Configuration is a single JSON file mounted at `/etc/gate/config.json`, with
+Configuration is a single YAML file mounted at `/etc/gate/config.yaml`, with
 env-var overrides for the essentials. A reference file is provided at
-[`config.example.json`](config.example.json).
+[`config.example.yaml`](config.example.yaml).
 
 ### Schema
 
-```jsonc
-{
-  "vllm_host": "vllm",              // env override: VLLM_HOST
-  "vllm_port": 8000,                 // env override: VLLM_PORT
-  "listen_host": "0.0.0.0",          // env override: LISTEN_HOST
-  "listen_port": 8000,               // env override: LISTEN_PORT
-  "metrics_poll_interval_s": 2.0,
-  "stale_after_s": 6.0,
-  "chars_per_token": 4,
-  "default_max_tokens": 256,
-  "thresholds": [                     // required, >= 1 entry
-    { "kv_pct": 50, "max_context": 4096, "timeout_s": 15 },
-    { "kv_pct": 80, "max_context": 1024, "timeout_s": 30 }
-  ]
-}
+```yaml
+# env overrides: VLLM_HOST, VLLM_PORT, LISTEN_HOST, LISTEN_PORT
+vllm_host: vllm
+vllm_port: 8000
+listen_host: 0.0.0.0
+listen_port: 8000
+metrics_poll_interval_s: 2.0
+stale_after_s: 6.0
+chars_per_token: 4
+default_max_tokens: 256
+
+# required, >= 1 entry (env override: THRESHOLDS_JSON, a JSON list)
+thresholds:
+  - kv_pct: 50
+    max_context: 4096
+    timeout_s: 15
+  - kv_pct: 80
+    max_context: 1024
+    timeout_s: 30
 ```
 
 ### Reference

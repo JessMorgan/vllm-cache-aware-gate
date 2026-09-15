@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn[standard]>=0.29",
     "httpx>=0.27",
     "prometheus_client>=0.20",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +45,11 @@ strict = true
 
 [[tool.mypy.overrides]]
 module = ["httpx.*", "fastapi.*", "uvicorn.*"]
+ignore_missing_imports = true
+
+# PyYAML ships no type stubs / py.typed marker.
+[[tool.mypy.overrides]]
+module = ["yaml"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

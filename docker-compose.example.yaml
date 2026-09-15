@@ -21,9 +21,9 @@ services:
       VLLM_PORT: "8000"
       THRESHOLDS_JSON: '[{"kv_pct":50,"max_context":4096,"timeout_s":15},{"kv_pct":80,"max_context":1024,"timeout_s":30}]'
       LOG_LEVEL: INFO
-    # Alternative to THRESHOLDS_JSON: mount a config file instead.
+    # Alternative to THRESHOLDS_JSON: mount a YAML config file instead.
     # volumes:
-    #   - ./config.json:/etc/gate/config.json:ro
+    #   - ./config.yaml:/etc/gate/config.yaml:ro
     healthcheck:
       test:
         - python

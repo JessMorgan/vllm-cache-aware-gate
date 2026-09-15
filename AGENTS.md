@@ -40,8 +40,10 @@ edge modules (HTTP proxy, metrics poller, config loader) that only the
 FastAPI app wires together.
 
 - **`src/gate/config.py`** — `Threshold` and `GateConfig` dataclasses;
-  `load_config(path)` with env-var overrides; strict startup validation.
-  `kv_pct` is a **percentage (0–100)**; the vLLM metric is a **fraction (0–1)**.
+  `load_config(path)` reads a **YAML** file (if any) and applies env-var
+  overrides, then validates strictly. `kv_pct` is a **percentage (0–100)**;
+  the vLLM metric is a **fraction (0–1)**. The `THRESHOLDS_JSON` env override
+  is still parsed as JSON (a JSON list), even though the file is YAML.
 - **`src/gate/tokens.py`** — `estimate_context_tokens(body, cfg) -> int`.
   Pure. Estimates prompt tokens as `ceil(prompt_chars / chars_per_token)` plus
   `max_tokens` headroom (default 256). Chat vs completions prompt-text
@@ -65,7 +67,7 @@ FastAPI app wires together.
   background task, run uvicorn; graceful shutdown.
 - **`tests/`** — `test_tokens.py`, `test_router.py`, `test_metrics.py`,
   `test_api.py` (ASGI end-to-end with a fake vLLM), `test_poller.py`.
-- **`Dockerfile`**, **`docker-compose.example.yaml`**, **`config.example.json`**,
+- **`Dockerfile`**, **`docker-compose.example.yaml`**, **`config.example.yaml`**,
   **`Makefile`**, **`README.md`** — packaging, operator reference, and docs.
 
 **Proxied endpoints (v1):** `POST /v1/chat/completions` and
@@ -255,7 +257,7 @@ Before committing any complete change:
    abandoning. Do not treat a clean or critical review as an automatic decision
    — the user's final call is definitive and cannot be overridden.
 4. Update all relevant documentation to reflect the new reality, including
-   `AGENTS.md`, `README.md`, `config.example.json`, and any other checked-in
+   `AGENTS.md`, `README.md`, `config.example.yaml`, and any other checked-in
    documentation affected by the change.
 5. Confirm the documentation and runtime metadata agree, then commit the
    complete change to git only after the user has decided how to proceed from
@@ -345,7 +347,8 @@ When considering a dependency:
   need.
 
 For this project the runtime footprint is deliberately tiny (`fastapi`,
-`uvicorn[standard]`, `httpx`, `prometheus_client` for its text parser). Do not
+`uvicorn[standard]`, `httpx`, `prometheus_client` for its text parser,
+`PyYAML` for config parsing). Do not
 pull in a tokenizer, an LLM SDK, or a large framework in v1 — the gate is a
 proxy, not an inference engine.
 
@@ -403,7 +406,7 @@ proxy, not an inference engine.
 
 - `README.md` — quickstart, config reference, decision logic, 429 contract,
   operational notes, v2 roadmap.
-- `config.example.json` — the reference configuration with the `thresholds`
+- `config.example.yaml` — the reference configuration with the `thresholds`
   entry contract.
 - `AGENTS.md` (this file) — architecture map, test commands, git workflow, and
   the load-bearing invariants above.
