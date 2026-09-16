@@ -129,14 +129,15 @@ def estimate_context_tokens(body: bytes, cfg: GateConfig) -> int | None:
 
 
 def extract_request_model(body: bytes) -> str:
-    """Extract the request's ``model`` field for stats labeling.
+    """Extract the request's ``model`` field (the routing key and stats label).
 
     Pure and defensive: never raises. Returns the request's ``model`` string
     (the original, unstripped value) when the body is valid UTF-8 JSON with a
     non-empty string ``model`` field; otherwise returns ``"unknown"``.
 
-    The result is used only as a stats label (the future multi-server routing
-    key) — never for the gate's forward/reject decision.
+    The result selects which backend's admission state drives the
+    forward/reject decision (multi-backend routing; an unowned or
+    ``"unknown"`` model falls to the default backend) and labels the stats.
     """
     try:
         text = body.decode("utf-8")

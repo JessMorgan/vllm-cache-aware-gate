@@ -52,11 +52,8 @@ def test_happy_path_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     created: dict = {}
     sentinel_app = object()
 
-    def fake_create_app(
-        cfg_arg: GateConfig, *, cache: object, upstream: object, start_poller: bool
-    ) -> object:
+    def fake_create_app(cfg_arg: GateConfig, *, upstream: object, start_poller: bool) -> object:
         created["cfg"] = cfg_arg
-        created["cache"] = cache
         created["upstream"] = upstream
         created["start_poller"] = start_poller
         return sentinel_app
@@ -80,10 +77,10 @@ def test_happy_path_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
 
     main_mod.main()
 
-    # create_app wiring contract.
+    # create_app wiring contract (per-backend state is built internally;
+    # main only supplies the shared upstream client).
     assert created["cfg"] is cfg
     assert created["start_poller"] is True
-    assert isinstance(created["cache"], main_mod.MetricsCache)
     assert isinstance(created["upstream"], FakeClient)
 
     # uvicorn.run received the app create_app returned, with listen host/port.

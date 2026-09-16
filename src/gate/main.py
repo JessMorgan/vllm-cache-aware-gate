@@ -20,7 +20,6 @@ import uvicorn
 
 from gate.app import create_app
 from gate.config import ConfigError, load_config
-from gate.metrics import MetricsCache
 
 log = logging.getLogger("gate.main")
 
@@ -56,8 +55,7 @@ def main() -> None:
         log.info("tiered policy: none — autoconfig only")
 
     client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
-    cache = MetricsCache()
-    app = create_app(cfg, cache=cache, upstream=client, start_poller=True)
+    app = create_app(cfg, upstream=client, start_poller=True)
 
     uvicorn.run(app, host=cfg.listen_host, port=cfg.listen_port, log_level=level.lower())
 

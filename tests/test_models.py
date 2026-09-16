@@ -220,3 +220,41 @@ def test_resolve_unowned_after_sync_returns_none():
     reg.sync("a", {"m"})
     reg.sync("a", set())
     assert reg.resolve("m") is None
+
+
+# --- ModelRegistry.items (enumeration) ----------------------------------------
+
+
+def test_items_empty_registry():
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=True)
+    assert reg.items() == []
+
+
+def test_items_lists_owned_models_with_owner():
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=True)
+    reg.register_backend("b", is_default=False)
+    reg.sync("a", {"m1", "m2"})
+    reg.sync("b", {"m3"})
+    assert reg.items() == [("m1", "a"), ("m2", "a"), ("m3", "b")]
+
+
+def test_items_applies_collision_winner():
+    """A model owned by two backends appears once, under the resolved owner."""
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.register_backend("b", is_default=True)
+    reg.sync("a", {"m", "a-only"})
+    reg.sync("b", {"m"})
+    # b is the default -> wins the collision; a keeps its own model.
+    assert reg.items() == [("a-only", "a"), ("m", "b")]
+
+
+def test_items_drops_unowned_models():
+    """Models no backend owns do not appear."""
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.sync("a", {"m1", "m2"})
+    reg.sync("a", {"m1"})
+    assert reg.items() == [("m1", "a")]

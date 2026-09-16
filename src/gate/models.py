@@ -119,6 +119,22 @@ class ModelRegistry:
             return None
         return self._winner(model, owners)
 
+    def items(self) -> list[tuple[str, str]]:
+        """Enumerate every owned model as ``(model, resolved_backend)``.
+
+        Read-only, for the aggregate ``GET /v1/models`` and ``/healthz``.
+        Each model appears exactly once, under its resolved owner (the same
+        collision winner as :meth:`resolve`); models owned by no backend do
+        not appear. Order follows registration order of the owning backend,
+        then the model id.
+        """
+        result: list[tuple[str, str]] = []
+        for backend in self._order:
+            for model in sorted(self._owned.get(backend, ())):
+                if self._winner(model, self._owners(model)) == backend:
+                    result.append((model, backend))
+        return result
+
     def _owners(self, model: str) -> list[str]:
         """Backends owning ``model``, in registration order."""
         return [b for b in self._order if model in self._owned.get(b, ())]
