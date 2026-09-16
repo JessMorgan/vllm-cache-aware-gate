@@ -2,11 +2,15 @@
 
 A small, single-purpose **reverse-proxy "gate"** container that sits in front of
 one or more vLLM OpenAI-compatible backends and protects their KV caches from
-over-subscription. It speaks the OpenAI API, routes each incoming request to the
-configured backend that serves the request body's `model` (unknown/unparseable
-models fall to the default backend), and per request decides: **forward** (that
-backend's KV cache has room for this prompt's estimated size) or **reject with
-HTTP 429 + `Retry-After`** (not enough room — retry in N seconds). It learns
+over-subscription. It speaks the OpenAI API, resolves each incoming request's
+body `model` to the configured backends that serve it (a **candidate set** — a
+model id may be served by 2+ backends; unknown/unparseable models fall to the
+default backend) and picks a candidate via a per-model **routing policy**
+(default `round_robin`), and per request decides: **forward** (that
+candidate's KV cache has room for this prompt's estimated size) or **reject
+with HTTP 429 + `Retry-After`** (not enough room — retry in N seconds; in a
+multi-candidate walk a reject/transport-failure/5xx is a *skip* to the next
+candidate — pre-stream only). It learns
 each backend's headroom by polling that backend's Prometheus `/metrics` endpoint
 (one background poller per backend, reading `vllm:kv_cache_usage_perc` and the
 KV-cache capacity) and its `GET /v1/models` (model discovery). Admission state
@@ -46,21 +50,34 @@ pure, dependency-free functions (trivially unit-testable); the I/O lives in thin
 edge modules (HTTP proxy, metrics poller, config loader) that only the
 FastAPI app wires together.
 
-- **`src/gate/config.py`** — `Threshold`, `Backend`, and `GateConfig`
-  dataclasses; `load_config(path)` reads a **YAML** file (if any) and applies
-  env-var overrides, then validates strictly. `kv_pct` is a **percentage
-  (0–100)**; the vLLM metric is a **fraction (0–1)**. The `THRESHOLDS_JSON` and
-  `BACKENDS_JSON` env overrides are parsed as JSON (JSON lists), even though
-  the file is YAML; `BACKENDS_JSON` **replaces** the file's `backends:`
-  entirely (env wins). `backends` is a **REQUIRED** non-empty list of
-  `Backend(name, host, port, models=(), default=False,
+- **`src/gate/config.py`** — `Threshold`, `Backend`, `RoutingEntry`, and
+  `GateConfig` dataclasses; `load_config(path)` reads a **YAML** file (if any)
+  and applies env-var overrides, then validates strictly. `kv_pct` is a
+  **percentage (0–100)**; the vLLM metric is a **fraction (0–1)**. The
+  `THRESHOLDS_JSON` and `BACKENDS_JSON` env overrides are parsed as JSON (JSON
+  lists), even though the file is YAML; `BACKENDS_JSON` **replaces** the file's
+  `backends:` entirely (env wins). `backends` is a **REQUIRED** non-empty list
+  of `Backend(name, host, port, models=(), default=False,
   thresholds=None, target_kv_cache_pct=None, token_margin=None, retry_min_s=None,
   retry_max_s=None)` entries — each `None` knob means "use the global default";
-  at most one `default: true`; model ids globally unique across backends; the
-  legacy `vllm_host`/`vllm_port` keys and `VLLM_HOST`/`VLLM_PORT` env vars are
-  **removed** (a config using them fails with a migration-hint `ConfigError`).
-  `thresholds` is **optional** (an empty/absent tiered policy just means the
-  tiered layer always allows). Also carries the global defaults of the four
+  at most one `default: true`; **model ids may be duplicated across backends**
+  (the normal multi-candidate case — the `routing:` section decides which
+  backend gets a request); only **duplicate ids within one backend's `models:`**
+  list are a `ConfigError`; the legacy `vllm_host`/`vllm_port` keys and
+  `VLLM_HOST`/`VLLM_PORT` env vars are **removed** (a config using them fails
+  with a migration-hint `ConfigError`). `thresholds` is **optional** (an
+  empty/absent tiered policy just means the tiered layer always allows). A new
+  optional top-level **`routing:`** section (file-only — no env override) maps
+  model id → `RoutingSpec` (`policy` ∈ {`round_robin`, `primary_fallback`,
+  `large_small`, `even`, `fill`}, non-empty `order` of configured backend
+  names — also the failover order — and `threshold_tokens` (int ≥ 1) present
+  **iff** `policy` is `large_small`); omitted or `{}` is valid; every
+  malformed entry is a `ConfigError`; the "at most one entry per model" rule
+  holds via **last-wins** (yaml.safe_load cannot detect duplicate mapping
+  keys — safe in outcome, see the known-deviation note in `_parse_routing`).
+  The `order ⊆ serving` check is deliberately **not** config-time: it is a
+  startup-time, logged-not-fatal check (the poller's dead-candidate warning).
+  Also carries the global defaults of the four
   autoconfig knobs with env overrides: `target_kv_cache_pct` (`85.0`,
   `TARGET_KV_CACHE_PCT`), `retry_min_s` (`5`, `RETRY_MIN_S`), `retry_max_s`
   (`60`, `RETRY_MAX_S`), `token_margin` (`1.25`, `TOKEN_MARGIN`), plus
@@ -72,9 +89,10 @@ FastAPI app wires together.
   unparseable body (caller fails open). Chat vs completions prompt-text
   extraction. Intentionally a heuristic (no tokenizer dependency). Also
   `extract_request_model(body) -> str` (pure, never raises): the request
-  body's `model` string, or `"unknown"` — the **routing key** (selects the
-  backend via the `ModelRegistry`; `"unknown"` falls to the default backend)
-  and the stats `model` label.
+   body's `model` string, or `"unknown"` — the **routing key** (selects the
+   candidate backends via the `ModelRegistry`'s
+   `resolve_candidates`; `"unknown"` falls to the default backend) and the
+   stats `model` label.
 - **`src/gate/metrics.py`** — `parse_kv_cache_usage(text) -> float | None`
   (max across all `vllm:kv_cache_usage_perc` series),
   `parse_kv_cache_usage_by_model(text) -> dict[str, float] | None` (per-model
@@ -88,18 +106,24 @@ FastAPI app wires together.
   stores the per-model breakdown while `_value` stays the MAX of it),
    `CapacityCache` (last good capacity token count; never stale, only unknown),
    and `KvRemaining` — the in-memory estimated-remaining-KV counter
-   (`reanchor(tokens)` resets, `subtract(tokens)` is unclamped and a no-op when
-   never anchored, `value()` returns `int | None`). All three are **reused once
-   per backend** by the app (`BackendState`); the parse functions are shared
-   across backends.
+    (`reanchor(tokens)` resets, `subtract(tokens)` is unclamped and a no-op when
+    never anchored, `add(tokens)` re-adds — the **inverse of `subtract`**, the
+    failover charge-rollback primitive, same no-op-when-unanchored contract,
+    `value()` returns `int | None`). All three are **reused once
+    per backend** by the app (`BackendState`); the parse functions are shared
+    across backends.
 - **`src/gate/poller.py`** — `run_poller(client, cache, url, interval_s, *,
   counter, target_frac, capacity_cache, model_url, model_refresh_s, registry,
-  backend_name, explicit_models, capacity_unavailable)`: **one instance per
+  backend_name, explicit_models, capacity_unavailable, on_reanchor,
+  routing_order)`: **one instance per
   backend** (the app's lifespan starts one task per configured backend). Each
   tick makes ONE `GET` via `fetch_metrics` and, on an observed (HTTP 200) body,
   updates **that backend's** usage + per-model caches, **re-anchors its
   `KvRemaining` counter** to `anchor_remaining_tokens(capacity, target_frac,
-  usage_frac)`, and updates its `CapacityCache`. **Fails open** on any
+  usage_frac)`, and updates its `CapacityCache`. On every re-anchor it invokes
+  the `on_reanchor` callback **synchronously** (no `await` between) — the app
+  wires it to increment the backend's monotonic `anchor_seq` (the failover
+  charge-rollback guard). **Fails open** on any
   transport error / non-200 (keeps ALL state — caches and counter — no crash).
   **Capacity-missing is per-backend fail-open (no exit):** an observed body
   missing a usable KV-cache capacity (the `vllm:kv_cache_size_tokens` gauge or
@@ -113,23 +137,32 @@ FastAPI app wires together.
   owned)` where `owned` is the explicit `models` set when a non-empty
   `explicit_models` tuple is given, else the discovered served set; a failed
   fetch or unparseable body keeps the last known map (auxiliary, never fatal).
+  Also runs the **`order` ⊆ serving dead-candidate check** when `routing_order`
+  is wired: on each successful discovery tick, for every model whose `routing:`
+  `order` names this backend, if the model is NOT in this backend's owned set
+  the backend is a **dead candidate** for that model and a WARNING is logged
+  **once per (model, backend) pair** — logged, not fatal (the walk fails open).
 - **`src/gate/models.py`** — `parse_v1_models(text) -> list[str] | None`
   (pure; parses an OpenAI `GET /v1/models` body `{"data": [{"id": ...}]}` into
   the ordered id list; `None` on non-JSON, missing/non-list `data`, or a
-  missing/empty `id`). `ModelRegistry` — the stateful `model → backend_name`
-  routing map, single-asyncio-loop contract (pollers write via `sync`, request
-  handlers read via `resolve`; no locks): `register_backend(name, *,
-  is_default)` (once per backend at app build; config order is the collision
-  tie-break), `sync(name, owned_models)` (reconcile one backend's owned set;
-  released models re-resolve against the remaining backends — default wins —
-  else stop resolving), `resolve(model) -> str | None` (`None` ⇒
-  unknown-model path ⇒ default backend), `items()` (every owned model as
-  `(model, resolved_backend)`, for the aggregate `GET /v1/models` and
-  `/healthz`). Collision policy: a model owned by two backends (only
-  reachable via auto-adopt — explicit duplicates are a config error) resolves
-  to the `default: true` backend if any owner is the default, else the
-  first-registered owner; the conflict is logged once per (model, backend)
-  pair.
+   missing/empty `id`). `ModelRegistry` — the stateful `model → ordered
+   candidate list` routing map, single-asyncio-loop contract (pollers write via
+   `sync`, request handlers read via `resolve_candidates`; no locks):
+   `register_backend(name, *, is_default)` (once per backend at app build;
+   config/registration order is the candidate order), `sync(name, owned_models)`
+   (reconcile one backend's owned set; a model left owned by no backend stops
+   resolving — the unknown-model path), **`resolve_candidates(model) ->
+   tuple[str, ...]`** — the v2 routing lookup: the ordered backend-name tuple
+   serving `model` (single-owner ⇒ 1-tuple; multi-owner ⇒ **all owners** in
+   registration order — **duplicate model ids are legal**, the normal
+   multi-candidate case; unowned ⇒ `()`), `resolve(model) -> str | None`
+   (retained — returns the single resolved owner for the `owned_by` scalar
+   form; for a multi-owner model it is the collision winner: the `default:
+   true` backend if any owner is the default, else the first-registered owner;
+   the conflict is logged once per (model, backend) pair), `items()` (every
+   owned model as `(model, resolved_backend)`, for the aggregate
+   `GET /v1/models` and `/healthz`). The routing policy (not a collision
+   policy) chooses among a model's candidates.
 - **`src/gate/router.py`** — `decision(usage_pct, ctx_tokens, thresholds) ->
   Decision`. Pure. The heart of the tiered gate: highest-tier-only selection +
   inclusive `ctx_tokens <= max_context` comparison. Also the always-on
@@ -142,6 +175,29 @@ FastAPI app wires together.
   `[min_s, max_s]`; `remaining <= 0` → `max_s`), and
   `combine_decisions(tier, auto) -> Decision` (AND; both-reject → max timeout,
   tie → tiered).
+- **`src/gate/routing.py`** — the pure **routing-selection** layer.
+  `RoutingSpec(policy, order, threshold_tokens=None)` and `CandidateView(
+  usage_frac, remaining_tokens, capacity_tokens, token_margin)` (fraction/token
+  space; `None` = stale/never-fetched feed or unanchored counter); the five
+  policy-name constants + `POLICIES`; and `select_backend(spec, candidates,
+  ctx_tokens, usage_views) -> int | None` (pure; returns the **index** into
+  `candidates` to attempt first — the app's failover walk advances from there —
+  or `None` when `fill` finds no eligible candidate / `candidates` is empty).
+  Rules: `round_robin`/`primary_fallback` → `0` (the app's stateful per-model
+  RR index offsets the RR selection; PF relies on the skip-on-reject walk);
+  `large_small` → `0` iff `ctx_tokens` is known and `ctx_tokens >=
+  threshold_tokens` (inclusive), else `1` (clamped to `0` with a 1-candidate
+  order); `even` → the index **minimizing the spread** (max−min) of the
+  *projected* usage fractions — candidate `i` at `usage_i + ceil(ctx × margin_i)
+  / capacity_i`, every other candidate at its current usage — unknowns ranked
+  **last** (in index order), ties → lowest index (**not** greedy
+  least-loaded); `fill` → the lowest index whose feed is stale/unanchored
+  (always eligible — fail-open) or whose `ctx_tokens is None` (fail-open) or
+  where `ceil(ctx × margin) <= remaining` (the exact `decision_auto` admission
+  test); eligible-but-unknowns are interleaved in **global config order** (not
+  ranked last — this is what keeps `fill` ≡ `primary_fallback` on stale
+  feeds). The stateful per-model RR index and the failover walk live in
+  `app.py` (thin wrappers, same single-asyncio-loop contract as `KvRemaining`).
 - **`src/gate/proxy.py`** — `proxy_request(httpx, request, base_url, *,
   stream) -> Response`. Transparent forward of method/path/query/headers/body
   to the given `base_url` (the routed backend's `http://host:port`); streams
@@ -151,60 +207,115 @@ FastAPI app wires together.
   `prometheus_client.CollectorRegistry`** (never the global default), the
   `gate_*` metric objects, and `render()` (Prometheus text exposition for
   `GET /metrics`). In-memory only; resets on restart by design.
-   `record_forwarded/rejected` (model-keyed — model ids are globally unique
-   across backends), `set_kv_usage` (fraction→percent, removes stale model
-   series; the app unions all backends' by-model maps, max on key collisions),
-   `set_freshness(backend, fresh, age_s)`, `set_remaining(backend, int | None)`
-   (the `gate_kv_cache_remaining_tokens{backend}` gauge — the gate's own live
-   estimate of remaining KV tokens; `None` renders `NaN`), and
-   `set_backend_capacity_unavailable(backend, bool)` (the new
-   `gate_backend_capacity_unavailable{backend}` 0/1 alert gauge). `gate_config_info`
-   serializes the backend structure (`backends_json`: name/host/port/default +
-   which knobs are overridden) but **not** the `models` lists (discovered data
-   would go stale).
+    `record_forwarded/rejected` (carry `endpoint`, `model`, `result`, and a
+    **`backend` label** — the final backend: the forwarder, the max-timeout
+    rejector on 429 exhaustion, or the sentinel `"none"` on 502 exhaustion —
+    because with duplicate model ids legal the backend is no longer
+    recoverable from the model), `record_failover(model, from, to, reason)`
+    (the `gate_routing_failovers_total{model, from, to, reason}` counter —
+    pre-stream failover skips, reason ∈ `transport` | `upstream_5xx` |
+    `reject`), `set_kv_usage` (fraction→percent, removes stale model series;
+    the app unions all backends' by-model maps, max on key collisions),
+    `set_freshness(backend, fresh, age_s)`, `set_remaining(backend, int | None)`
+    (the `gate_kv_cache_remaining_tokens{backend}` gauge — the gate's own live
+    estimate of remaining KV tokens; `None` renders `NaN`), and
+    `set_backend_capacity_unavailable(backend, bool)` (the
+    `gate_backend_capacity_unavailable{backend}` 0/1 alert gauge).
+    `gate_config_info` serializes the backend structure (`backends_json`:
+    name/host/port/default + which knobs are overridden) **and** the `routing:`
+    section (`routing_json`: `[[model, policy, [order...]], ...]`, `[]` when
+    absent — startup-static for operator audit) but **not** the `models` lists
+    (discovered data would go stale).
 - **`src/gate/app.py`** — Builds the FastAPI app: routes
   (`POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`,
-  `GET /healthz`, `GET /metrics`), the 429 builder, and the wiring of the
+  `GET /healthz`, `GET /metrics`), the 429/502 builders, and the wiring of the
   per-backend pollers + caches + proxy + stats (each decision is recorded as a
   pure side effect; `/metrics` renders the stats and always returns 200). Owns
   one `BackendState` per configured backend (`MetricsCache`, `CapacityCache`,
   `KvRemaining`, resolved thresholds/autoconfig policy/target_frac, `base_url`,
-  the per-backend `capacity_unavailable` flag) plus the shared `ModelRegistry`
-  and the default-backend name. The lifespan starts **one poller task per
+  the per-backend `capacity_unavailable` flag, and the per-backend monotonic
+  `anchor_seq` — incremented by the poller's `on_reanchor` callback; the
+  failover charge-rollback guard), the per-model `RoutingState` (stateful
+  per-model `round_robin` index — advances only on a successful forward), the
+  per-model `RoutingSpec` map (from `cfg.routing`), plus the shared
+  `ModelRegistry` and the default-backend name. The lifespan starts **one
+  poller task per
   backend** (each with its own fatal done-callback, which now fires only on an
   unexpected task death — the capacity path no longer raises). Per generation
-  request: routes by the body's `model` (`registry.resolve` else the default
-  backend), applies the **staleness gate per backend** (stale/never-fetched
-  feed → both layers fail open for that backend regardless of the counter),
-  AND-combines that backend's tiered and autoconfig decisions via
-  `combine_decisions`, charges **that backend's** counter
-  (`counter.subtract(ceil(ctx × margin))`) on every forward **before** the
-  proxy await, and proxies to that backend's `base_url`; the 429 is
-  rejector-aware, names the backend and model, and uses that backend's
-  `Retry-After`. `GET /v1/models` is gate-local (aggregate of the registry's
-  known models with an `owned_by` extension; always 200, never proxied).
+  request: resolves the body's `model` to a **candidate set**
+  (`registry.resolve_candidates`; empty ⇒ single candidate = the default
+  backend, the `round_robin` spec), filters the `routing:` spec's `order` to
+  serving backends only (a backend named in `order` that does not serve the
+  model is a **dead candidate** the walk skips — the poller separately warns
+  about it; if the filter drops every candidate, the default backend is used),
+  selects the first candidate with the pure `select_backend` (a `fill`
+  all-full `None` ⇒ no candidate is proxied, but the walk still runs — without
+  proxying — to collect the per-candidate `retry_after` values for the
+  max-Retry-After 429), then runs the **failover walk** (per candidate: the
+  **staleness
+  gate** (stale/never-fetched feed → both layers fail open for it regardless of
+  the counter — a stale candidate is *not* skipped), the two AND-combined
+  admission layers via `combine_decisions` on **that candidate's**
+  thresholds/counter/policy; a reject is a **skip** (skip-on-reject); an allow
+  charges **that candidate's** counter
+  (`counter.subtract(ceil(ctx × margin))`) **before** the proxy await, then
+  proxies to its `base_url`; a **pre-stream transport failure or upstream 5xx**
+  is also a skip — the charge is rolled back via `KvRemaining.add` **only if
+  the candidate's `anchor_seq` is unchanged since the charge** (a re-anchor in
+  between makes the fresh anchor authoritative; the charge is dropped); once a
+  streamed response has started, errors surface as-is (no walk); the walk never
+  short-circuits). **Exhaustion:** any candidate 429'd → one 429 with
+  `Retry-After = max` of the candidates' retries (reported rejector = the
+  max-timeout backend, tie → first in walk order; the message names it and the
+  model); every candidate transport-failed (no HTTP answer) → **502** (never
+  200/429; the body names the backends tried; stats record the sentinel
+  `backend="none"`); a pre-stream 5xx on the **last** candidate is
+  **propagated as-is** (status and body unmasked) and recorded as forwarded
+  with that backend. Each skip is counted by
+  `gate_routing_failovers_total` (and logged `routing_failover model=… from=…
+  to=… reason=…`). `GET /v1/models` is gate-local (aggregate of the registry's
+  known models with an `owned_by` extension — a **list** of backend names when
+  the model is served by 2+ backends, a **scalar** when single-owner; always
+  200, never proxied).
   `GET /healthz` carries a per-backend array (`name`, `metrics_age_s`,
   `kv_usage`, `kv_cache_capacity_tokens`, `kv_cache_remaining_tokens`) plus the
-  known models.
+  known models (each with `owned_by` — scalar or list — and `routing`, the
+  policy in effect: the `routing:` entry's policy or `round_robin`).
 - **`src/gate/main.py`** — `main()` entrypoint: load config, log **one INFO
   line per backend** (name, host:port, `[default]`, effective tier count —
   `N tier(s)` or `none — autoconfig only` — and the four autoconfig knobs with
-  `(override)` marking the per-backend values), build the app (the pollers are
-  started by the app lifespan, not here), and run uvicorn. There is **no CLI**
-  — argv is ignored (autoconfig is always on).
+  `(override)` marking the per-backend values), then **one INFO line per
+  `routing:` entry** (model → policy + order, plus `threshold_tokens` for
+  `large_small`; an empty `routing:` section logs nothing), build the app (the
+  pollers are started by the app lifespan, not here), and run uvicorn. There is
+  **no CLI** — argv is ignored (autoconfig is always on).
 - **`tests/`** — `test_tokens.py`, `test_router.py`, `test_metrics.py`,
-  `test_models.py` (parse + registry), `test_config.py` (backends +
-  `BACKENDS_JSON` + validation), `test_stats.py`, `test_api.py` (ASGI
-  end-to-end with fake vLLMs — multi-backend routing included), `test_poller.py`,
-  `test_main.py`.
+  `test_models.py` (parse + registry, incl. `resolve_candidates`: single-owner
+  1-tuple, multi-owner ordered tuple, removal), `test_routing.py` (pure
+  `select_backend` per policy — RR/PF = 0 at selection, `large_small`
+  at/below/above the inclusive threshold + 1-candidate clamp, `even` ranking
+  incl. unknowns-last and ties, `fill` first-fit / all-full → `None` /
+  unknowns eligible, spec/order edge cases), `test_config.py` (backends +
+  `BACKENDS_JSON` + validation + `routing:` parsing/validation — bad policy,
+  empty order, unknown backend in order, `threshold_tokens` iff `large_small`;
+  duplicate model ids across backends **now legal**), `test_stats.py`,
+  `test_api.py` (ASGI end-to-end with fake vLLMs — multi-backend routing,
+  per-policy routing, pre-stream failover + charge rollback, exhaustion
+  429-max / 502 / last-5xx-propagated, `/v1/models` duplicate `owned_by`,
+  per-backend + per-model `routing` in `/healthz`, the `backend` label and
+  `gate_routing_failovers_total`), `test_poller.py`, `test_main.py`.
 - **`Dockerfile`**, **`docker-compose.example.yaml`**, **`config.example.yaml`**,
   **`Makefile`**, **`README.md`** — packaging, operator reference, and docs.
 
 **Proxied endpoints (v1):** `POST /v1/chat/completions` and
-`POST /v1/completions` (both consume KV cache; each is routed to the backend
-owning the request body's `model`, else the default backend). `GET /v1/models`
-is gate-local (the aggregate model list with an `owned_by` extension — never
-proxied, always 200). `GET /healthz` for liveness (per-backend state),
+`POST /v1/completions` (both consume KV cache; each is routed to the candidate
+backends owning the request body's `model` — via the `routing:` policy, or the
+default backend when the model is unowned/unparseable — with a pre-stream
+failover walk across the candidate `order`). `GET /v1/models`
+is gate-local (the aggregate model list with an `owned_by` extension — a list
+of backend names for a model served by 2+ backends — never
+proxied, always 200). `GET /healthz` for liveness (per-backend state + the
+known models with their `routing` policy in effect),
 `GET /metrics` for the gate's own Prometheus stats (gate-local, never proxied,
 never 429s — always 200). Everything else → 404. No auth, no TLS
 termination (v1).
@@ -238,9 +349,11 @@ mean a green CI run; the container job is skipped (with a warning) when
 docker is absent.
 
 The `tests/test_api.py` suite drives the gate end-to-end against fake vLLMs
-(`httpx.ASGITransport` + a mock upstream transport — including two-backends
-routing cases), so the allow / 429 / fail-open / streaming / routing paths are
-all exercised without a real model.
+(`httpx.ASGITransport` + a mock upstream transport — including multi-backend
+routing, per-policy routing, and pre-stream failover cases), so the allow /
+429 / fail-open / streaming / routing / failover paths are all exercised
+without a real model; `tests/test_routing.py` unit-tests the pure
+`select_backend` selection for all five policies.
 
 ## Working copies: always work in a worktree, never in the main checkout
 
@@ -602,12 +715,12 @@ proxy, not an inference engine.
 
 5. **Per backend, the gate takes the MAX across all
    `vllm:kv_cache_usage_perc` series.** vLLM may emit one series per
-   `model_name`; models on one backend share its KV pool (single-engine vLLM),
-   so the per-backend max (conservative) is the correct admission input for
-   that backend. Do not take the first or the mean. Across backends the gate's
-   `gate_kv_cache_usage_pct` gauge unions all backends' per-model breakdowns
-   (max on a repeated key, which can only happen for the synthetic
-   `default` label). (`metrics.py`, `app.py`)
+    `model_name`; models on one backend share its KV pool (single-engine vLLM),
+    so the per-backend max (conservative) is the correct admission input for
+    that backend. Do not take the first or the mean. Across backends the gate's
+    `gate_kv_cache_usage_pct` gauge unions all backends' per-model breakdowns
+    (max on a repeated key — a model id served by 2+ backends, or the synthetic
+    `default` label). (`metrics.py`, `app.py`)
 
 6. **The gate is a transparent proxy for the two generation endpoints only.**
    `/v1/chat/completions` and `/v1/completions` are forwarded verbatim to the
@@ -707,33 +820,35 @@ proxy, not an inference engine.
     #2 still applies to the *tiered* path (`usage_frac * 100.0 >= kv_pct`); do
     not conflate the two conversions. (`app.py`, `router.py`)
 
-15. **Model ids are globally unique across backends — enforced at config
-    load.** Two backends listing the same id in their explicit `models:` is a
-    startup `ConfigError`. This makes the `model → backend` map total and the
-    unknown-model fallback unambiguous, and lets the model-keyed stats
-    (`gate_requests_total`, `gate_request_ctx_tokens`) stay model-keyed.
-    Runtime collisions from auto-adopt are handled by the `ModelRegistry`
-    (the `default: true` backend wins, else the first-registered owner;
-    logged once per (model, backend) pair — not fatal, since the operator did
-    not type them). A deployment serving the same model id on two backends
-    (A/B, canary) is out of scope — it would need a routing rule.
-    (`config.py`, `models.py`)
+15. **Superseded by gotcha #19 — model ids are no longer globally unique
+    across backends.** (Kept in place so the old "uniqueness enforced at
+    config load" rule is explicitly retired.) The `routing:` section
+    (decision 11) decides which backend gets a request, and duplicate ids are
+    the normal multi-candidate case. (Only **duplicate ids within one
+    backend's `models:`** list remain a `ConfigError`.) The `model → backend`
+    map became a `model → candidate set` map, and the traffic metrics carry a
+    `backend` label alongside `model` (gotcha #20).
+    (`config.py`, `models.py`, `routing.py`, `stats.py`)
 
 16. **Unknown/unparseable models route to the default backend.** A request
     whose `model` is owned by no backend (or is the unparseable `"unknown"`)
     is forwarded to the backend flagged `default: true` (fallback: the first
     entry), and vLLM returns its own canonical "model not found" error; the
     admission layers still apply on that backend. A model that stops being
-    owned (dropped on a discovery refresh) resolves `None` and takes the same
-    path — the gate never hard-404s a model. (`app.py`, `models.py`)
+    owned (dropped on a discovery refresh) resolves to an **empty candidate
+    tuple** (`resolve_candidates` → `()`) and takes the same path — the gate
+    never hard-404s a model. (`app.py`, `models.py`)
 
 17. **`GET /v1/models` is gate-local and aggregated (always 200, never 429,
-    never proxied).** It lists the registry's known models — one entry per
-    model with an `owned_by` extension naming the resolved owning backend (a
-    collided model appears once, under its resolved owner) — so the backends'
-    own `/v1/models` endpoints are *not* reachable through the gate. It is
-    the third always-200 gate-local endpoint next to `/healthz` and
-    `/metrics`. (`app.py`)
+    never proxied) — duplicate-aware.** It lists the registry's known models
+    — one entry per model with an `owned_by` extension: a **list** of backend
+    names when the model is served by 2+ backends (duplicate ids are legal —
+    gotcha #19), a **scalar** name when single-owner — so the backends' own
+    `/v1/models` endpoints are *not* reachable through the gate. It is the
+    third always-200 gate-local endpoint next to `/healthz` and
+    `/metrics` (`/healthz` also carries a per-model `routing` field — the
+    policy in effect, the `routing:` entry's policy or `round_robin`).
+    (`app.py`)
 
 18. **Model discovery is auxiliary and never fatal.** Each backend's owned
     model set is the explicit `models:` list when present (it wins), else the
@@ -743,6 +858,64 @@ proxy, not an inference engine.
     last known map (the poller logs a warning only on a state change). Do not
     make discovery failures reject requests or clear the registry.
     (`poller.py`, `models.py`)
+
+19. **Duplicate model ids are LEGAL (supersedes the v1 uniqueness rule —
+    gotcha #15).** A model id owned by 2+ backends (explicit `models:` or
+    auto-adopt) is the **normal multi-candidate case**, not a collision:
+    `ModelRegistry.resolve_candidates` returns ALL owners in registration
+    (config) order, and the request is routed per its **`routing:` policy** —
+    the entry's `policy` when one exists, else **`round_robin`** over the
+    candidates in config order (decision 11). The `routing:` section is
+    **optional** (omitted or `{}` valid) and **file-only** (no env override);
+    every malformed entry is a `ConfigError` (policy from the five-value set;
+    non-empty `order` of configured backend names; `threshold_tokens` int ≥ 1
+    present **iff** `large_small`). The "at most one `routing:` entry per
+    model" rule holds via **last-wins**, not a `ConfigError` (`yaml.safe_load`
+    silently keeps the last of duplicate mapping keys — safe in outcome).
+    `order` is **both** the candidate order and the **failover order**; a
+    backend named in `order` that does not serve the model is a **dead
+    candidate** the walk skips (each poller logs a WARNING once per
+    (model, backend) pair — logged, not fatal). (`config.py`, `models.py`,
+    `routing.py`, `app.py`, `poller.py`)
+
+20. **Pre-stream failover + anchor-guarded charge rollback (all policies,
+    decision 12).** The candidate `order` is also the failover order: on a
+    **transport error or upstream 5xx before the first response byte**, the
+    gate skips that candidate and walks the remainder, re-running admission on
+    the next; **a 429 from a candidate also triggers the next** (skip-on-reject
+    — what makes `fill` ≈ `primary_fallback`, gotcha #21). On a skip, the
+    failed candidate's counter charge is **rolled back via
+    `KvRemaining.add(ceil(ctx × margin))`**, but **only if that backend's
+    `anchor_seq` is unchanged since the charge** (a re-anchor in between makes
+    the fresh anchor authoritative — the old charge is dropped, never
+    double-counted; the poller increments `anchor_seq` synchronously with each
+    re-anchor). The **walk never short-circuits** — every remaining candidate
+    is attempted before exhaustion. **Once a streamed response has started,
+    errors surface as-is** (no failover — gotcha #6 preserved in-flight).
+    Each skip is counted by `gate_routing_failovers_total{model, from, to,
+    reason}` (reason ∈ `transport` | `upstream_5xx` | `reject`). (`app.py`,
+    `metrics.py`, `poller.py`)
+
+21. **Exhaustion rule + `fill` ≈ `primary_fallback` (decision 12, invariant
+    19).** All candidates 429'd (none forwarded) → a single **429** with
+    `Retry-After = max` of the candidates' retries (reported rejector = the
+    max-timeout backend, **tie → first in walk order**; the message names it
+    and the model). All candidates transport-failed (no HTTP answer) →
+    **502** — never 200, never 429 (the request never got a capacity answer;
+    the body names the backends tried; stats record the sentinel
+    `backend="none"`). A pre-stream 5xx on the **last** candidate is
+    **propagated as-is** (status AND body unmasked — gotcha #6; the
+    single-backend case is exactly this) and recorded as **forwarded** with
+    that backend. `fill` and `primary_fallback` **reach the same surviving
+    candidate for every request** (both run the same walk; `fill`'s prefilter
+    is the exact `decision_auto` admission test, so it can disagree with the
+    walk on no candidate): they differ only in selection cost and in one
+    corner — a candidate whose autoconfig layer admits but whose **tiered**
+    layer rejects (and on stale/unanchored feeds `fill`'s prefilter passes
+    every unknown, degenerating to the config-order walk). Both are kept as
+    **distinct policies on operator intent** ("fill my pools in order" vs
+    "hot primary, backups"); do not collapse them. (`app.py`, `routing.py`,
+    `stats.py`)
 
 ## Authoritative docs (read on demand)
 

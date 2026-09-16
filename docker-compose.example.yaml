@@ -22,8 +22,17 @@
 # Multi-backend: add more entries to `BACKENDS_JSON` (each with a unique
 # `name`, `host`, `port`, and at most one `default: true`), and start a
 # corresponding backend service (or point at external ones). Requests are
-# routed by the request body's `model` field to the backend that owns it;
-# unknown models fall to the `default: true` backend.
+# routed by the request body's `model` field to the backends that serve it;
+# unknown models fall to the `default: true` backend. A model id MAY be
+# served by more than one backend (duplicate model ids are legal): such a
+# model is routed by its `routing:` policy (default `round_robin`) with a
+# pre-stream failover walk across the `order`.
+#
+# NOTE: the `routing:` section is FILE-ONLY (there is no env override): to
+# configure routing policies, mount a YAML config file (see the commented
+# `volumes:` block below and config.example.yaml for the full `backends:` /
+# `routing:` contracts) — or rely on the `round_robin` default for
+# duplicate model ids.
 services:
   gate:
     build: .
@@ -31,11 +40,14 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # REQUIRED — at least one backend. This example points at the local
-      # `vllm` placeholder. A multi-backend example (second entry shown
-      # commented) would add another object to the JSON list:
+      # REQUIRED — at least one backend (a JSON list of backend objects).
+      # This example points at the local `vllm` placeholder. A multi-backend
+      # example adds more objects to the JSON list (each with a unique `name`):
       #   [{"name":"qwen","host":"vllm-qwen","port":8000,"default":true},
-      #    {"name":"llama","host":"vllm-llama","port":8001}]
+      #    {"name":"qwen-fast","host":"vllm-qwen-fast","port":8001},
+      #    {"name":"llama","host":"vllm-llama","port":8002}]
+      # Duplicate model ids across backends are legal (see the note above);
+      # their routing is configured in the file-only `routing:` section.
       BACKENDS_JSON: '[{"name":"qwen","host":"vllm","port":8000,"default":true}]'
       # Optional tiered policy (autoconfig is always on regardless). Omit for
       # an autoconfig-only run.
