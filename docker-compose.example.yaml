@@ -1,20 +1,29 @@
 # Example only — adjust to your deployment.
 #
-# Reference stack: the gate in front of a vLLM instance.
+# Reference stack: the gate in front of vLLM backend(s).
 #
-# The gate needs no flags or CLI — autoconfig is always on. It runs with only
-# VLLM_HOST/VLLM_PORT (zero-config). THRESHOLDS_JSON below is OPTIONAL: it adds
-# the tiered policy on top of the always-on autoconfig layer; remove it (and
-# any config volume) for a pure zero-config run.
+# The gate needs no flags or CLI — autoconfig is always on. It REQUIRES at
+# least one configured backend via `BACKENDS_JSON` (a JSON list of backend
+# objects; env wins over any file `backends:`) or a mounted config file with a
+# `backends:` list. The legacy VLLM_HOST/VLLM_PORT env vars are REMOVED.
+# THRESHOLDS_JSON below is OPTIONAL: it adds the tiered policy on top of the
+# always-on autoconfig layer; remove it (and any config volume) for an
+# autoconfig-only run.
 #
 # The `vllm` service below is a PLACEHOLDER. It needs a GPU (vLLM does not
 # run usefully on CPU), so:
 #   - For local GPU development: uncomment the `command:` line and set the
 #     model you want to serve.
-#   - In production you will usually point `VLLM_HOST` at an external vLLM
+#   - In production you will usually point a backend at an external vLLM
 #     instance instead — in that case remove the `vllm` service (and the
-#     `depends_on`) entirely and set `VLLM_HOST`/`VLLM_PORT` to that
-#     instance's address.
+#     `depends_on`) entirely and set that backend's `host`/`port` in
+#     `BACKENDS_JSON` to the instance's address.
+#
+# Multi-backend: add more entries to `BACKENDS_JSON` (each with a unique
+# `name`, `host`, `port`, and at most one `default: true`), and start a
+# corresponding backend service (or point at external ones). Requests are
+# routed by the request body's `model` field to the backend that owns it;
+# unknown models fall to the `default: true` backend.
 services:
   gate:
     build: .
@@ -22,13 +31,18 @@ services:
     ports:
       - "8000:8000"
     environment:
-      VLLM_HOST: vllm
-      VLLM_PORT: "8000"
+      # REQUIRED — at least one backend. This example points at the local
+      # `vllm` placeholder. A multi-backend example (second entry shown
+      # commented) would add another object to the JSON list:
+      #   [{"name":"qwen","host":"vllm-qwen","port":8000,"default":true},
+      #    {"name":"llama","host":"vllm-llama","port":8001}]
+      BACKENDS_JSON: '[{"name":"qwen","host":"vllm","port":8000,"default":true}]'
       # Optional tiered policy (autoconfig is always on regardless). Omit for
-      # a zero-config run.
+      # an autoconfig-only run.
       THRESHOLDS_JSON: '[{"kv_pct":50,"max_context":4096,"timeout_s":15},{"kv_pct":80,"max_context":1024,"timeout_s":30}]'
       LOG_LEVEL: INFO
-    # Alternative to THRESHOLDS_JSON: mount a YAML config file instead.
+    # Alternative to BACKENDS_JSON/THRESHOLDS_JSON: mount a YAML config file
+    # instead (see config.example.yaml for the full `backends:` contract).
     # volumes:
     #   - ./config.yaml:/etc/gate/config.yaml:ro
     healthcheck:
