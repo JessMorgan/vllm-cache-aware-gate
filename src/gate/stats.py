@@ -23,11 +23,21 @@ Invariants (see AGENTS.md "Known gotchas"):
   (``gate_metrics_fresh``, ``gate_metrics_age_s``) and the remaining-KV gauge
   (``gate_kv_cache_remaining_tokens``) carry a ``backend`` label — each
   backend is set on every ``/metrics`` render, so a per-backend series is
-  always present once the app has backends. ``gate_kv_cache_usage_pct`` and
-  the request counters stay model-keyed (model ids are globally unique
-  across backends). ``gate_backend_capacity_unavailable{backend}`` is the
-  per-backend alert flag for a live-but-capacity-less ``/metrics`` body
-  (per-backend fail-open, decision 10).
+  always present once the app has backends. ``gate_kv_cache_usage_pct`` stays
+  model-keyed (keyed by vLLM's ``model_name`` label — the two-namespace rule
+  still holds). The request counters (``gate_requests_total``,
+  ``gate_request_ctx_tokens``) carry a ``backend`` label **alongside**
+  ``model`` (decision 13): with duplicate model ids legal (decision 11), the
+  backend is no longer recoverable from the model. The label is the final
+  backend — the one that forwarded, the max-timeout rejector on 429
+  exhaustion, or the sentinel ``"none"`` on 502 exhaustion (no rejector
+  exists). ``gate_routing_failovers_total{model, from, to, reason}`` counts
+  pre-stream failover skips (reason ∈ ``transport`` | ``upstream_5xx`` |
+  ``reject``; decision 12). ``gate_backend_capacity_unavailable{backend}`` is
+  the per-backend alert flag for a live-but-capacity-less ``/metrics`` body
+  (per-backend fail-open, decision 10). ``gate_config_info`` serializes the
+  backend structure and the ``routing:`` section (``routing_json``:
+  ``[[model, policy, [order...]], ...]``, startup-static for operator audit).
 
 - A per-app registry is required: the app creates one ``GateStats`` per
   process, and tests create many apps, so the global default registry must
@@ -79,18 +89,28 @@ class GateStats:
 
         self._requests_total = Counter(
             "gate_requests_total",
-            "Generation requests decided by the gate, by endpoint, model, and result "
-            "(forwarded/rejected).",
-            ["endpoint", "model", "result"],
+            "Generation requests decided by the gate, by endpoint, model, result "
+            "(forwarded/rejected), and backend (the final backend: the forwarder, "
+            "the max-timeout rejector on 429 exhaustion, or 'none' on 502 "
+            "exhaustion).",
+            ["endpoint", "model", "result", "backend"],
             registry=self._registry,
         )
         self._ctx_tokens = Histogram(
             "gate_request_ctx_tokens",
-            "Estimated context tokens (prompt + headroom) of requests, by model and "
-            "result. Median via histogram_quantile(0.5, ...).",
-            ["model", "result"],
+            "Estimated context tokens (prompt + headroom) of requests, by model, "
+            "result, and backend. Median via histogram_quantile(0.5, ...).",
+            ["model", "result", "backend"],
             registry=self._registry,
             buckets=CTX_TOKENS_BUCKETS,
+        )
+        self._routing_failovers = Counter(
+            "gate_routing_failovers_total",
+            "Pre-stream failover skips: a candidate rejected (429), transport-failed, "
+            "or returned a pre-stream upstream 5xx, so the walk moved to the next "
+            "candidate (reason: reject | transport | upstream_5xx).",
+            ["model", "from", "to", "reason"],
+            registry=self._registry,
         )
         self._kv_usage = Gauge(
             "gate_kv_cache_usage_pct",
@@ -137,26 +157,45 @@ class GateStats:
 
         self._set_config(cfg)
 
-    def record_forwarded(self, endpoint: str, model: str, ctx_tokens: int | None) -> None:
+    def record_forwarded(
+        self, endpoint: str, model: str, ctx_tokens: int | None, *, backend: str
+    ) -> None:
         """Count a forwarded (allowed) request.
 
-        The request counter always increments. The context-token histogram is
-        observed only when ``ctx_tokens`` is known — fail-open unparseable
-        requests have no estimate and must not skew the size distribution.
+        ``backend`` is the backend the request was forwarded to (decision 13:
+        with duplicate model ids legal, the backend is no longer recoverable
+        from the model). The request counter always increments. The
+        context-token histogram is observed only when ``ctx_tokens`` is known
+        — fail-open unparseable requests have no estimate and must not skew
+        the size distribution.
         """
-        self._requests_total.labels(endpoint, model, "forwarded").inc()
+        self._requests_total.labels(endpoint, model, "forwarded", backend).inc()
         if ctx_tokens is not None:
-            self._ctx_tokens.labels(model, "forwarded").observe(ctx_tokens)
+            self._ctx_tokens.labels(model, "forwarded", backend).observe(ctx_tokens)
 
-    def record_rejected(self, endpoint: str, model: str, ctx_tokens: int | None) -> None:
-        """Count a rejected (429) request.
+    def record_rejected(
+        self, endpoint: str, model: str, ctx_tokens: int | None, *, backend: str
+    ) -> None:
+        """Count a rejected request (429 exhaustion, or 502 exhaustion).
 
-        In practice rejected requests always have a ``ctx_tokens`` estimate,
-        but the ``None`` guard is kept for symmetry and robustness.
+        ``backend`` is the reported rejector's backend on 429 exhaustion, or
+        the sentinel ``"none"`` on 502 exhaustion (no rejector exists). In
+        practice rejected requests always have a ``ctx_tokens`` estimate, but
+        the ``None`` guard is kept for symmetry and robustness.
         """
-        self._requests_total.labels(endpoint, model, "rejected").inc()
+        self._requests_total.labels(endpoint, model, "rejected", backend).inc()
         if ctx_tokens is not None:
-            self._ctx_tokens.labels(model, "rejected").observe(ctx_tokens)
+            self._ctx_tokens.labels(model, "rejected", backend).observe(ctx_tokens)
+
+    def record_failover(self, model: str, from_backend: str, to_backend: str, reason: str) -> None:
+        """Count one pre-stream failover skip (decision 12).
+
+        ``reason`` is one of ``"reject"`` (the candidate 429'd — skip-on-
+        reject), ``"transport"`` (the candidate's proxy transport-failed
+        pre-stream), or ``"upstream_5xx"`` (the candidate returned a 5xx
+        before the first response byte).
+        """
+        self._routing_failovers.labels(model, from_backend, to_backend, reason).inc()
 
     def set_kv_usage(self, by_model: dict[str, float]) -> None:
         """Set the per-model fill gauges from the cache's by-model fractions.
@@ -216,11 +255,20 @@ class GateStats:
         are deliberately omitted — they are discovered at runtime and would
         go stale (keep the info metric small and startup-static).
         ``cfg.backends`` is always non-empty (config validation, decision 6).
+
+        The ``routing_json`` label serializes the ``routing:`` section
+        (decision 9/15): a JSON list of ``[model, policy, [order...]]`` per
+        entry — startup-static (the config is loaded once), useful for
+        operator audit. An empty ``routing:`` section renders as ``[]``.
         """
         thresholds_json = json.dumps(
             [[t.kv_pct, t.max_context, t.timeout_s] for t in cfg.thresholds]
         )
         backends_json = json.dumps([_backend_info(b) for b in cfg.backends], separators=(",", ":"))
+        routing_json = json.dumps(
+            [[e.model, e.spec.policy, list(e.spec.order)] for e in cfg.routing],
+            separators=(",", ":"),
+        )
         labels: dict[str, str] = {
             "listen_host": str(cfg.listen_host),
             "listen_port": str(cfg.listen_port),
@@ -231,6 +279,7 @@ class GateStats:
             "default_max_tokens": str(cfg.default_max_tokens),
             "thresholds_json": thresholds_json,
             "backends_json": backends_json,
+            "routing_json": routing_json,
         }
         self._config_info.info(labels)
 

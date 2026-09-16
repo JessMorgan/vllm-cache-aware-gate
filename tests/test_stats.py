@@ -2,8 +2,12 @@
 
 Covers the multi-backend additions (docs/plans/multi-backend.md §2.5): the
 ``backend`` label on the feed/remaining gauges, the
-``gate_backend_capacity_unavailable`` gauge, and the ``gate_config_info``
-backend-structure serialization (which omits the ``models:`` lists).
+``gate_backend_capacity_unavailable`` gauge, the ``backend`` label on the
+request counters (decision 13 — with duplicate model ids legal, the backend
+is no longer recoverable from the model; the sentinel ``"none"`` on 502
+exhaustion), the ``gate_routing_failovers_total`` counter (decision 12), and
+the ``gate_config_info`` backend-structure + ``routing:`` serialization
+(which omits the ``models:`` lists).
 """
 
 from __future__ import annotations
@@ -47,61 +51,184 @@ def _config_labels(stats: GateStats) -> dict[str, str]:
     raise AssertionError("gate_config_info family not found in rendered output")
 
 
+# Prometheus renders labels in ALPHABETICAL order regardless of the definition
+# order, so the rendered-text assertions below use the alphabetical label order
+# (backend, endpoint, model, result) for gate_requests_total and (backend,
+# model, result) for the ctx_tokens histogram.
+
+
 class TestRecordForwarded:
     def test_increments_counter(self) -> None:
         stats = make_stats()
-        stats.record_forwarded("chat_completions", "m", 500)
+        stats.record_forwarded("chat_completions", "m", 500, backend="qwen")
         text = stats.render().decode()
         assert (
-            'gate_requests_total{endpoint="chat_completions",model="m",result="forwarded"} 1.0'
-            in text
+            'gate_requests_total{backend="qwen",endpoint="chat_completions",model="m",'
+            'result="forwarded"} 1.0' in text
         )
 
     def test_observes_histogram(self) -> None:
         stats = make_stats()
-        stats.record_forwarded("chat_completions", "m", 500)
+        stats.record_forwarded("chat_completions", "m", 500, backend="qwen")
         text = stats.render().decode()
-        assert 'gate_request_ctx_tokens_count{model="m",result="forwarded"} 1.0' in text
-        assert 'gate_request_ctx_tokens_sum{model="m",result="forwarded"} 500.0' in text
-        assert 'gate_request_ctx_tokens_bucket{le="512.0",model="m",result="forwarded"} 1.0' in text
+        assert (
+            'gate_request_ctx_tokens_count{backend="qwen",model="m",result="forwarded"} 1.0' in text
+        )
+        assert (
+            'gate_request_ctx_tokens_sum{backend="qwen",model="m",result="forwarded"} 500.0' in text
+        )
+        assert (
+            'gate_request_ctx_tokens_bucket{backend="qwen",le="512.0",model="m",'
+            'result="forwarded"} 1.0' in text
+        )
 
     def test_none_skips_histogram(self) -> None:
         # A fail-open unparseable request (no estimate) increments the counter
         # but must not skew the size distribution.
         stats = make_stats()
-        stats.record_forwarded("chat_completions", "m", 500)
-        stats.record_forwarded("chat_completions", "m", None)
+        stats.record_forwarded("chat_completions", "m", 500, backend="qwen")
+        stats.record_forwarded("chat_completions", "m", None, backend="qwen")
         text = stats.render().decode()
         assert (
-            'gate_requests_total{endpoint="chat_completions",model="m",result="forwarded"} 2.0'
-            in text
+            'gate_requests_total{backend="qwen",endpoint="chat_completions",model="m",'
+            'result="forwarded"} 2.0' in text
         )
-        assert 'gate_request_ctx_tokens_count{model="m",result="forwarded"} 1.0' in text
+        assert (
+            'gate_request_ctx_tokens_count{backend="qwen",model="m",result="forwarded"} 1.0' in text
+        )
 
 
 class TestRecordRejected:
     def test_increments_counter(self) -> None:
         stats = make_stats()
-        stats.record_rejected("completions", "n", 9000)
+        stats.record_rejected("completions", "n", 9000, backend="llama")
         text = stats.render().decode()
-        assert 'gate_requests_total{endpoint="completions",model="n",result="rejected"} 1.0' in text
+        assert (
+            'gate_requests_total{backend="llama",endpoint="completions",model="n",'
+            'result="rejected"} 1.0' in text
+        )
 
     def test_observes_histogram(self) -> None:
         stats = make_stats()
-        stats.record_rejected("completions", "n", 9000)
+        stats.record_rejected("completions", "n", 9000, backend="llama")
         text = stats.render().decode()
-        assert 'gate_request_ctx_tokens_count{model="n",result="rejected"} 1.0' in text
-        assert 'gate_request_ctx_tokens_sum{model="n",result="rejected"} 9000.0' in text
+        assert (
+            'gate_request_ctx_tokens_count{backend="llama",model="n",result="rejected"} 1.0' in text
+        )
+        assert (
+            'gate_request_ctx_tokens_sum{backend="llama",model="n",result="rejected"} 9000.0'
+            in text
+        )
+
+    def test_502_exhaustion_uses_none_sentinel(self) -> None:
+        # On 502 exhaustion (no rejector exists) the backend label is the
+        # sentinel "none" (decision 13).
+        stats = make_stats()
+        stats.record_rejected("completions", "n", 9000, backend="none")
+        text = stats.render().decode()
+        assert (
+            'gate_requests_total{backend="none",endpoint="completions",model="n",'
+            'result="rejected"} 1.0' in text
+        )
+
+
+class TestRequestCounterLabels:
+    def test_requests_total_label_set(self) -> None:
+        # The label set is exactly {endpoint, model, result, backend} — the
+        # existing labels are preserved and backend is added LAST (decision 13).
+        stats = make_stats()
+        stats.record_forwarded("chat_completions", "m", 500, backend="qwen")
+        labels: dict[str, str] = {}
+        for family in text_string_to_metric_families(stats.render().decode()):
+            # prometheus_client strips the _total suffix: the family is named
+            # "gate_requests", the sample "gate_requests_total".
+            if family.name == "gate_requests":
+                for sample in family.samples:
+                    if sample.name == "gate_requests_total":
+                        labels = sample.labels
+        assert labels == {
+            "endpoint": "chat_completions",
+            "model": "m",
+            "result": "forwarded",
+            "backend": "qwen",
+        }
+
+    def test_ctx_tokens_label_set(self) -> None:
+        # The label set is exactly {model, result, backend} (decision 13).
+        # The histogram's _count/_sum/_bucket children render under the base
+        # family name, so match the sample name, not the family name.
+        stats = make_stats()
+        stats.record_forwarded("chat_completions", "m", 500, backend="qwen")
+        labels: dict[str, str] = {}
+        for family in text_string_to_metric_families(stats.render().decode()):
+            if family.name == "gate_request_ctx_tokens":
+                for sample in family.samples:
+                    if sample.name == "gate_request_ctx_tokens_count":
+                        labels = sample.labels
+        assert labels == {"model": "m", "result": "forwarded", "backend": "qwen"}
+
+    def test_distinct_backends_are_separate_series(self) -> None:
+        # The same model on two backends (duplicate model ids, decision 11)
+        # yields distinct series — the backend label is what separates them.
+        stats = make_stats()
+        stats.record_forwarded("chat_completions", "m", 100, backend="qwen")
+        stats.record_forwarded("chat_completions", "m", 200, backend="llama")
+        text = stats.render().decode()
+        assert (
+            'gate_requests_total{backend="qwen",endpoint="chat_completions",model="m",'
+            'result="forwarded"} 1.0' in text
+        )
+        assert (
+            'gate_requests_total{backend="llama",endpoint="chat_completions",model="m",'
+            'result="forwarded"} 1.0' in text
+        )
+
+
+class TestRoutingFailovers:
+    def test_increments_per_call(self) -> None:
+        stats = make_stats()
+        stats.record_failover("m", "qwen", "llama", "transport")
+        stats.record_failover("m", "qwen", "llama", "upstream_5xx")
+        stats.record_failover("m", "qwen", "llama", "reject")
+        text = stats.render().decode()
+        # Alphabetical label order: from, model, reason, to.
+        assert (
+            'gate_routing_failovers_total{from="qwen",model="m",reason="transport",to="llama"} 1.0'
+            in text
+        )
+        assert (
+            'gate_routing_failovers_total{from="qwen",model="m",'
+            'reason="upstream_5xx",to="llama"} 1.0' in text
+        )
+        assert (
+            'gate_routing_failovers_total{from="qwen",model="m",reason="reject",to="llama"} 1.0'
+            in text
+        )
+
+    def test_distinct_reasons_are_separate_series(self) -> None:
+        stats = make_stats()
+        stats.record_failover("m", "a", "b", "reject")
+        stats.record_failover("m", "a", "b", "reject")
+        stats.record_failover("m", "a", "b", "transport")
+        text = stats.render().decode()
+        assert 'gate_routing_failovers_total{from="a",model="m",reason="reject",to="b"} 2.0' in text
+        assert (
+            'gate_routing_failovers_total{from="a",model="m",reason="transport",to="b"} 1.0' in text
+        )
 
 
 class TestPerModelSeparation:
     def test_distinct_model_series(self) -> None:
         stats = make_stats()
-        stats.record_forwarded("chat_completions", "m", 100)
-        stats.record_forwarded("chat_completions", "z", 200)
+        stats.record_forwarded("chat_completions", "m", 100, backend="qwen")
+        stats.record_forwarded("chat_completions", "z", 200, backend="qwen")
         text = stats.render().decode()
-        assert 'gate_request_ctx_tokens_sum{model="m",result="forwarded"} 100.0' in text
-        assert 'gate_request_ctx_tokens_sum{model="z",result="forwarded"} 200.0' in text
+        assert (
+            'gate_request_ctx_tokens_sum{backend="qwen",model="m",result="forwarded"} 100.0' in text
+        )
+        assert (
+            'gate_request_ctx_tokens_sum{backend="qwen",model="z",result="forwarded"} 200.0' in text
+        )
 
 
 class TestKvUsage:
@@ -325,6 +452,49 @@ class TestConfigInfo:
         # the startup-static info metric.
         assert "secret-model" not in text
 
+    def test_routing_json_empty(self) -> None:
+        # No routing: section -> the label is the empty JSON list, and the
+        # backends_json is still present (unchanged).
+        stats = make_stats()
+        labels = _config_labels(stats)
+        assert labels["routing_json"] == "[]"
+        assert "backends_json" in labels
+
+    def test_routing_json_serializes_entries(self) -> None:
+        from gate.config import Backend, RoutingEntry
+        from gate.routing import RoutingSpec
+
+        cfg = make_config()
+        cfg = replace(
+            cfg,
+            backends=(
+                Backend(name="qwen", host="h1", port=1, default=True),
+                Backend(name="llama", host="h2", port=2),
+            ),
+            routing=(
+                RoutingEntry(
+                    model="qwen3-32b",
+                    spec=RoutingSpec(policy="fill", order=("qwen", "llama")),
+                ),
+                RoutingEntry(
+                    model="big-model",
+                    spec=RoutingSpec(
+                        policy="large_small", order=("qwen", "llama"), threshold_tokens=8000
+                    ),
+                ),
+            ),
+        )
+        stats = GateStats(cfg, registry=CollectorRegistry())
+        labels = _config_labels(stats)
+        routing = json.loads(labels["routing_json"])
+        assert routing == [
+            ["qwen3-32b", "fill", ["qwen", "llama"]],
+            ["big-model", "large_small", ["qwen", "llama"]],
+        ]
+        # The backends_json is still serialized alongside (unchanged).
+        backends = json.loads(labels["backends_json"])
+        assert [b["name"] for b in backends] == ["qwen", "llama"]
+
 
 class TestRender:
     def test_returns_bytes_with_gate_header(self) -> None:
@@ -339,7 +509,7 @@ class TestRegistryIsolation:
     def test_recording_on_one_does_not_affect_other(self) -> None:
         a = GateStats(make_config(), registry=CollectorRegistry())
         b = GateStats(make_config(), registry=CollectorRegistry())
-        a.record_forwarded("chat_completions", "m", 500)
+        a.record_forwarded("chat_completions", "m", 500, backend="qwen")
         a.set_kv_usage({"A": 0.5})
         a_text = a.render().decode()
         b_text = b.render().decode()
