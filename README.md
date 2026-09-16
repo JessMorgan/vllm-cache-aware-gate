@@ -1,48 +1,94 @@
 # vllm-cache-aware-gate
 
-A small, single-purpose **reverse-proxy "gate"** container that sits in front of
-a [vLLM](https://docs.vllm.ai) OpenAI-compatible server and protects its KV
-cache from over-subscription. It speaks the OpenAI API and, per incoming
-request, decides one of two routes:
+A small, single-purpose **reverse-proxy "gate"** container that sits in front
+of one or more [vLLM](https://docs.vllm.ai) OpenAI-compatible backends and
+protects their KV caches from over-subscription. It speaks the OpenAI API,
+routes each incoming request to the configured backend that serves the request
+body's `model` (unknown/unparseable models fall to the default backend), and
+decides one of two routes **using that backend's KV state**:
 
-- **Forward** — the KV cache has room for this prompt's estimated size, so the
-  request is proxied to vLLM verbatim (including `stream: true` SSE).
+- **Forward** — that backend's KV cache has room for this prompt's estimated
+  size, so the request is proxied to it verbatim (including `stream: true`
+  SSE).
 - **Reject** — not enough room, so the client gets an
   **`HTTP 429` with a `Retry-After` header** telling it how long to wait.
 
-It learns the cache's headroom by polling vLLM's Prometheus `/metrics`
-endpoint and reading `vllm:kv_cache_usage_perc` (how full the cache is) and the
-KV-cache capacity in tokens — from the `vllm:kv_cache_size_tokens` gauge, or
-the `kv_cache_size_tokens` label on `vllm:cache_config_info` (the form current
-vLLM emits). It is designed
-for **safe, configuration-first, fail-open** operation: a monitoring outage
-never blocks inference traffic, and the gate is a transparent pass-through for
-the endpoints it proxies.
+It learns each backend's headroom by polling that backend's Prometheus
+`/metrics` endpoint (one background poller per backend) and reading
+`vllm:kv_cache_usage_perc` (how full the cache is) and the KV-cache capacity in
+tokens — from the `vllm:kv_cache_size_tokens` gauge, or the
+`kv_cache_size_tokens` label on `vllm:cache_config_info` (the form current vLLM
+emits) — and by polling the backend's `GET /v1/models` to learn which model ids
+it serves. It is designed for **safe, configuration-first, fail-open**
+operation: a monitoring outage never blocks inference traffic, and the gate is
+a transparent pass-through for the endpoints it proxies.
+
+> **Multi-backend / multi-model routing.** The gate now fronts **multiple**
+> vLLM backends, configured via a **required** `backends:` list. Admission
+> state (usage feed, capacity, remaining-KV counter, poller, policy) is
+> **per backend**: models on one backend share its KV pool (single-engine
+> vLLM), so a shared-KV backend is treated the same across its models. The
+> request body's `model` field is the **routing key** — it selects which
+> backend the request is proxied to and which backend's KV state the admission
+> layers evaluate. The legacy `vllm_host`/`vllm_port` config keys and
+> `VLLM_HOST`/`VLLM_PORT` env vars are **removed** (see
+> [Configuration](#configuration)).
 
 ---
 
 ## How it works
 
 ```
-                ┌────────────────────────────── gate container ─────────────────────────────┐
+                 ┌────────────────────────────── gate container ─────────────────────────────┐
  client ──8000─►│  FastAPI app                                                             │
  (OpenAI API)   │   • POST /v1/chat/completions ─┐                                           │
-                │   • POST /v1/completions   ───┤  RequestRouter ─► (allow)  ─► httpx ───────┼──► vLLM:8000
-                │   • GET  /healthz           ───┘            │            (reject) ─► 429 + Retry-After │   (proxied
-                │                                             │                                           │    transparently)
-                │   Background poller ── every Ns ─► GET vLLM:8000/metrics ─► MetricsCache              │
-                │        (fails → fail-open, keep retrying)                                          │
-                └──────────────────────────────────────────────────────────────────────────────────────┘
+                │   • POST /v1/completions   ───┤  route by the body's `model` →            │
+                │   • GET  /v1/models        ───┤  exactly one backend                     │
+                │   • GET  /healthz           ───┘  (unknown → default backend)             │
+                 │                                 │ per-backend admission                   │
+                 │                                 │                                        │
+                 │                          (allow) ─► httpx ──────┼──► vLLM backend A:8000 │
+                 │                          (reject) ─► 429 +      └──► vLLM backend B:8001 │
+                 │                                 Retry-After            (proxied           │
+                 │                                                transparently)             │
+                 │  one background poller per backend ─ every Ns ─► GET <backend>/metrics   │
+                 │    (fails → fail-open, keep retrying)                                    │
+                 │  every M s ─► GET <backend>/v1/models ─► ModelRegistry                   │
+                 │    (discovery fails → keep last known map; never fatal)                   │
+                 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Decision logic (per request)
+### Model routing (per request)
 
-Every request to the two generation endpoints is evaluated by **two admission
-layers, AND-combined**: the request forwards only if **both** allow. The first
-is the optional **tiered** policy below; the second is the always-on
-**[autoconfig](#autoconfig-always-on)** layer (see the next section). The
-combined rule, the 429 `Retry-After`, and the rejector-aware message are
-described in [The 429 contract](#the-429-contract).
+Every request to the two generation endpoints carries a `model` field. The gate
+resolves it to exactly one backend via the model→backend map the pollers learn
+(see [Model discovery](#metrics-ingestion--model-discovery)):
+
+- **Owned model** → the request is proxied to that backend, and **that
+  backend's** admission state (usage feed, capacity, remaining-KV counter,
+  policy) is evaluated.
+- **Unknown or unparseable `model`** (the gate reads an unparseable body as
+  `"unknown"`) → the request falls to the **default backend** — the one flagged
+  `default: true` in config, or the first `backends:` entry when none is
+  flagged — and vLLM returns its own canonical "model not found" error. The
+  admission layers still apply on that backend.
+- Model ids must be **unique across all backends** (validated at config load),
+  so the map is total and unambiguous.
+
+Routing is evaluated *before* admission: a 429 from one backend never affects
+the other backends' decisions.
+
+### Decision logic (per request, per backend)
+
+Every request is then evaluated by **two admission layers, AND-combined, on the
+routed backend's state**: the request forwards only if **both** allow. The
+first is the optional **tiered** policy below (evaluated with **that
+backend's** thresholds); the second is the always-on
+**[autoconfig](#autoconfig-always-on)** layer (evaluated with **that backend's**
+remaining-KV counter and policy). The combined rule, the 429 `Retry-After`, and
+the rejector-aware message are described in [The 429
+contract](#the-429-contract). Other backends are unaffected — a stale feed or
+full pool on one backend does not block traffic to the others.
 
 #### Tiered layer (optional)
 
@@ -54,7 +100,7 @@ described in [The 429 contract](#the-429-contract).
      the request, else `default_max_tokens` (default 256).
    - This is a **heuristic** — it deliberately over-estimates so the gate is
      conservative. There is no tokenizer dependency in v1.
-2. **Read current usage** from the in-memory cache:
+2. **Read current usage** from the routed backend's in-memory cache:
    `U_pct = usage_frac * 100` (the vLLM metric is a fraction 0–1; the config
    thresholds are percentages 0–100).
 3. **Select the governing tier** (highest-tier-only):
@@ -75,8 +121,9 @@ described in [The 429 contract](#the-429-contract).
 The tiered policy above is **optional**. The gate *always* also runs an
 **autoconfig** admission layer that admits each request by comparing its
 estimated size against an in-memory estimate of the KV space still available up
-to a target usage %. It needs no configuration — only the vLLM host/port — and
-uses sane defaults (see the [knob table](#autoconfig-knobs)). The two layers
+to a target usage %. It needs no per-request configuration (a `backends` list
+is the only hard requirement, and the knobs have sane defaults — see the
+[knob table](#autoconfig-knobs)). The two layers
 are **AND-combined**: a request forwards only if the tiered layer *and* the
 autoconfig layer both allow (with no tiers configured the tiered layer always
 allows, so the autoconfig layer is the sole gate).
@@ -84,7 +131,8 @@ allows, so the autoconfig layer is the sole gate).
 #### The remaining-KV counter
 
 The autoconfig layer keeps an in-memory counter of estimated remaining KV
-tokens (`KvRemaining`):
+tokens (`KvRemaining`) **per backend** — models on one backend share its KV
+pool, so a shared-KV backend is treated the same across its models:
 
 - **Reanchor on every good poll.** Each successful poll that carries both the
   usage fraction and the capacity gauge **resets** the counter to
@@ -143,6 +191,12 @@ tokens (`KvRemaining`):
 | `retry_max_s` | int | `60` | `RETRY_MAX_S` | Maximum `Retry-After` seconds for an autoconfig 429. `>= retry_min_s`. |
 | `token_margin` | number | `1.25` | `TOKEN_MARGIN` | Conservatism multiplier on the estimated context tokens. Finite, `>= 1.0`. |
 
+These are the **global defaults**. Each backend may override any of them (and
+the tiered `thresholds`) per-backend — a `None`/omitted per-backend value
+falls back to the global default (env overrides still set only the global
+defaults). The effective per-backend values are logged at startup with an
+`(override)` mark (see [Operational notes](#operational-notes)).
+
 #### Worked example
 
 Capacity 100 000, target 85%, margin 1.25, retry 5/60.
@@ -160,58 +214,75 @@ Capacity 100 000, target 85%, margin 1.25, retry 5/60.
   conservative than reality (25 000 real tokens consumed vs 31 250 charged —
   the margin); the reanchor corrects it.
 
-#### Fail-closed caveat
+#### Capacity-missing caveat (per-backend fail-open)
 
-- **A live vLLM whose `/metrics` lacks a usable KV-cache capacity** (the
-  `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
-  `vllm:cache_config_info`) cannot be anchored, so the gate **logs an error and
-  exits with status 1** (the process dies; an orchestrator restarts it). This
-  is the only process-killing failure and is deterministic.
+- **A live vLLM backend whose `/metrics` lacks a usable KV-cache capacity**
+  (the `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
+  `vllm:cache_config_info`) cannot anchor **that backend's** counter. This is
+  **not fatal**: the poller logs an error, the counter stays unanchored (so
+  that backend's autoconfig layer fails open), and the
+  `gate_backend_capacity_unavailable{backend}` gauge is set to `1` for
+  alerting. The poller keeps looping and **all other backends are unaffected**
+  — killing the whole proxy because one backend is misconfigured would take
+  down the healthy ones. Alert on the gauge rather than expecting a crash.
 - **An unreachable or stale feed is never fatal** — the gate **fails open**
   (forwards) and keeps retrying. A metrics outage never blocks traffic
   (invariant #1).
 
-#### Zero-config quickstart
+#### Minimal run
 
-The gate runs with **only the vLLM host/port** — no config file, no flags, no
-CLI at all:
+The gate needs **at least one configured backend** — there is no zero-config
+mode (the gate has no other way to learn its upstream):
 
 ```sh
 docker run -d --name gate \
   --network mynet \
   -p 8000:8000 \
-  -e VLLM_HOST=vllm \
-  -e VLLM_PORT=8000 \
+  -e BACKENDS_JSON='[{"name":"vllm","host":"vllm","port":8000,"default":true}]' \
   vllm-gate
 ```
 
+`backends` (file key) or `BACKENDS_JSON` (env) is **required** — an
+empty/absent list fails at startup with `at least one backend is required`.
 There is no `--auto` (or any) CLI flag; argv is ignored. A legacy invocation
 that passes `--auto` (or any other argument) still starts normally and behaves
 identically — autoconfig is always on.
 
-### Metrics ingestion & fail-open
+### Metrics ingestion & model discovery
 
-- A background async task polls `GET http://VLLM_HOST:VLLM_PORT/metrics` every
-  `metrics_poll_interval_s` (default 2s) with **one GET per tick** and, from the
-  same body, caches the latest `vllm:kv_cache_usage_perc` value (plus its fetch
-  timestamp and per-model breakdown) and the KV-cache capacity (the
+- **One background poller per configured backend.** Each poller polls
+  `GET http://<host>:<port>/metrics` every `metrics_poll_interval_s` (default
+  2s) with **one GET per tick** and, from the same body, updates
+  **that backend's** caches: the latest `vllm:kv_cache_usage_perc` value (plus
+  its fetch timestamp and per-model breakdown) and the KV-cache capacity (the
   `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
-  `vllm:cache_config_info`). On a good poll it also re-anchors the remaining-KV counter
-  (see [Autoconfig (always on)](#autoconfig-always-on)).
-- vLLM may emit one series per `model_name`. **v1 takes the max across all
-  series** for both the usage and the capacity gauges (conservative for a
-  single instance). v2 will key by `model_name`.
-- **Fail-open rules** (a monitoring outage must never take down inference):
-  - On any fetch/parse error the last good value is kept and the poller retries.
+  `vllm:cache_config_info`). On a good poll it also re-anchors **that
+  backend's** remaining-KV counter (see
+  [Autoconfig (always on)](#autoconfig-always-on)).
+- vLLM may emit one series per `model_name`. **Per backend, the gate takes the
+  max across all series** for both the usage and the capacity gauges —
+  conservative, and correct because all models on one backend share its KV
+  pool.
+- **Model discovery.** When model discovery is wired (always, in the app),
+  each poller also fetches that backend's `GET /v1/models` — on the first tick
+  and then every `model_refresh_interval_s` (default 30s) — and reconciles the
+  backend's owned model set in the shared model→backend registry. The
+  **explicit `models:` list (if present) always wins** over discovery; a
+  failed fetch or unparseable body **keeps the last known map** (discovery is
+  auxiliary and never fatal), logging a warning only on a state change.
+- **Fail-open rules** (a monitoring outage must never take down inference),
+  per backend:
+  - On any fetch/parse error the last good value is kept and the poller
+    retries.
   - If the cached value is older than `stale_after_s` (default 3× the poll
-    interval) it is treated as *unknown* → the request is **allowed** and a
-    warning is logged.
-- **Fail-closed (unconditional):** an observed (HTTP 200) body that lacks a
-  usable KV-cache capacity (the `vllm:kv_cache_size_tokens` gauge or the
-  `kv_cache_size_tokens` label on `vllm:cache_config_info`) cannot anchor the
-  counter, so the poller logs an error and the process exits with status 1 (see the
-  [fail-closed caveat](#fail-closed-caveat)). A merely unreachable vLLM is
-  never fatal.
+    interval) it is treated as *unknown* → the request is **allowed** (for
+    that backend) and a warning is logged.
+- **Capacity-missing (per-backend fail-open):** an observed (HTTP 200) body
+  that lacks a usable KV-cache capacity cannot anchor that backend's counter —
+  the poller logs an error, sets the
+  `gate_backend_capacity_unavailable{backend}` gauge, and keeps looping (see
+  the [capacity-missing caveat](#capacity-missing-caveat-per-backend-fail-open)).
+  A merely unreachable vLLM is never fatal.
 
 ---
 
@@ -223,53 +294,67 @@ identically — autoconfig is always on.
 docker build -t vllm-gate .
 ```
 
-### Run (pointing at a vLLM instance)
+### Run (pointing at one or more vLLM backends)
 
 ```sh
 docker run -d --name gate \
   --network mynet \
   -p 8000:8000 \
-  -e VLLM_HOST=vllm \
-  -e VLLM_PORT=8000 \
+  -e BACKENDS_JSON='[{"name":"qwen","host":"vllm-qwen","port":8000,"default":true},{"name":"llama","host":"vllm-llama","port":8001}]' \
   -e THRESHOLDS_JSON='[{"kv_pct":50,"max_context":4096,"timeout_s":15},{"kv_pct":80,"max_context":1024,"timeout_s":30}]' \
   vllm-gate
 ```
 
-`THRESHOLDS_JSON` is **optional** — it adds the optional tiered policy on top of
-the always-on autoconfig layer. Omit it (and the config file, if you have one)
-for a **zero-config** run: the gate needs only `VLLM_HOST` and `VLLM_PORT`. See
-the [zero-config quickstart](#zero-config-quickstart).
+`BACKENDS_JSON` is **required** (a JSON list of backend objects — it replaces
+any file `backends:` entirely; see [the `backends` entry
+contract](#backends-entry-contract-required)). `THRESHOLDS_JSON` is
+**optional** — it adds the optional tiered policy on top of the always-on
+autoconfig layer. The gate needs at least one backend and no CLI — see the
+[minimal run](#minimal-run).
 
-Then point your OpenAI client at the gate instead of vLLM:
+Then point your OpenAI client at the gate instead of vLLM — the `model` field
+selects the backend the request is routed to:
 
 ```sh
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"my-model","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}]}'
+
+# the gate's own aggregate model list (model → owning backend)
+curl http://localhost:8000/v1/models
+# 200 {"object":"list","data":[{"id":"qwen3-32b","object":"model","owned_by":"qwen"},
+#                               {"id":"llama-70b","object":"model","owned_by":"llama"}]}
 ```
 
 ### Compose
 
 See [`docker-compose.example.yaml`](docker-compose.example.yaml) for a
-reference stack (gate + a vLLM placeholder + a config volume mount).
+reference stack (gate + two vLLM placeholder backends + a `BACKENDS_JSON`
+example).
 
 ### Health
 
 ```sh
 curl http://localhost:8000/healthz
-# 200 {"status":"ok","metrics_age_s":1.2,"kv_usage":0.42,
-#      "kv_cache_capacity_tokens":100000,"kv_cache_remaining_tokens":35000}
+# 200 {"status":"ok",
+#      "backends":[{"name":"qwen","metrics_age_s":1.2,"kv_usage":0.42,
+#                   "kv_cache_capacity_tokens":100000,"kv_cache_remaining_tokens":35000},
+#                  {"name":"llama","metrics_age_s":1.8,"kv_usage":0.31,
+#                   "kv_cache_capacity_tokens":200000,"kv_cache_remaining_tokens":90000}],
+#      "models":[{"id":"qwen3-32b","owned_by":"qwen"},{"id":"llama-70b","owned_by":"llama"}]}
 ```
 
 `/healthz` always returns 200 for liveness; the body carries readiness info:
-`metrics_age_s` (age of the last successful metrics scrape), `kv_usage` (the
-last cached usage **fraction**, `null` if never fetched),
-`kv_cache_capacity_tokens` (the last cached KV-cache capacity — the
-`vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
-`vllm:cache_config_info` — `null` if never observed), and
-`kv_cache_remaining_tokens` (the autoconfig
-counter's current value, `null` if never anchored). Suitable for a Docker
-`HEALTHCHECK` or orchestrator liveness probe.
+`status`, a per-backend `backends` array (each entry with `name`,
+`metrics_age_s` — age of that backend's last successful metrics scrape,
+`kv_usage` — that backend's last cached usage **fraction**, `null` if never
+fetched, `kv_cache_capacity_tokens` — that backend's last cached KV-cache
+capacity, the `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens`
+label on `vllm:cache_config_info`, `null` if never observed, and
+`kv_cache_remaining_tokens` — that backend's autoconfig counter's current
+value, `null` if never anchored), plus `models` (the known model ids with
+`owned_by`). Suitable for a Docker `HEALTHCHECK` or orchestrator liveness
+probe.
 
 ---
 
@@ -282,18 +367,46 @@ env-var overrides for the essentials. A reference file is provided at
 ### Schema
 
 ```yaml
-# env overrides: VLLM_HOST, VLLM_PORT, LISTEN_HOST, LISTEN_PORT
-vllm_host: vllm
-vllm_port: 8000
+# env overrides: BACKENDS_JSON, LISTEN_HOST, LISTEN_PORT, THRESHOLDS_JSON,
+# TARGET_KV_CACHE_PCT, RETRY_MIN_S, RETRY_MAX_S, TOKEN_MARGIN,
+# MODEL_REFRESH_INTERVAL_S
+
+# REQUIRED — at least one backend (name + host + port). The legacy
+# vllm_host/vllm_port keys and VLLM_HOST/VLLM_PORT env vars are REMOVED.
+backends:
+  - name: qwen          # unique, non-empty; your mnemonic
+    host: vllm-qwen
+    port: 8000
+    default: true       # at most one backend may be default (fallback for
+                        # unknown models; the first entry if none is flagged)
+    # models: [qwen3-32b]   # optional mnemonic + validation anchor; omit to
+                            # auto-adopt from the backend's GET /v1/models
+    # Per-backend overrides (all optional — the global values below are the
+    # defaults):
+    # thresholds:
+    #   - kv_pct: 80
+    #     max_context: 8192
+    #     timeout_s: 30
+    # target_kv_cache_pct: 80.0
+    # token_margin: 1.5
+    # retry_min_s: 10
+    # retry_max_s: 120
+  - name: llama
+    host: vllm-llama
+    port: 8001
+    # no models: => auto-adopt from /v1/models; no overrides => global policy
+
 listen_host: 0.0.0.0
 listen_port: 8000
 metrics_poll_interval_s: 2.0
 stale_after_s: 6.0
+model_refresh_interval_s: 30.0  # per-backend /v1/models discovery cadence
 chars_per_token: 4
 default_max_tokens: 256
 
-# optional — the tiered policy (env override: THRESHOLDS_JSON, a JSON list).
-# Autoconfig runs regardless; with no tiers the tiered layer always allows.
+# optional global default — the tiered policy (env override: THRESHOLDS_JSON,
+# a JSON list). Autoconfig runs regardless; with no tiers the tiered layer
+# always allows. A backend may override this per-backend.
 thresholds:
   - kv_pct: 50
     max_context: 4096
@@ -302,7 +415,8 @@ thresholds:
     max_context: 1024
     timeout_s: 30
 
-# autoconfig (always on) — all optional, defaults shown
+# global defaults for the autoconfig (always on) knobs — all optional,
+# defaults shown. A backend may override any of them per-backend.
 target_kv_cache_pct: 85.0
 retry_min_s: 5
 retry_max_s: 60
@@ -313,19 +427,57 @@ token_margin: 1.25
 
 | Key | Type | Default | Env override | Meaning |
 |---|---|---|---|---|
-| `vllm_host` | string | `vllm` | `VLLM_HOST` | Hostname of the vLLM server. |
-| `vllm_port` | int | `8000` | `VLLM_PORT` | Port of the vLLM server (API + `/metrics`). |
+| `backends` | list | *(required — no default)* | `BACKENDS_JSON` | **REQUIRED** list of vLLM backends. An empty/absent list fails with `at least one backend is required`. `BACKENDS_JSON` (a JSON list) **replaces** the file's `backends:` entirely (env wins). See the [`backends` entry contract](#backends-entry-contract-required) below. |
 | `listen_host` | string | `0.0.0.0` | `LISTEN_HOST` | Bind address for the gate. |
 | `listen_port` | int | `8000` | `LISTEN_PORT` | Port the gate listens on. |
-| `metrics_poll_interval_s` | float | `2.0` | — | How often to poll `/metrics`. |
-| `stale_after_s` | float | `6.0` | — | Age after which a cached value is treated as unknown (fail-open). |
-| `chars_per_token` | int | `4` | — | Heuristic divisor for prompt token estimation. |
-| `default_max_tokens` | int | `256` | — | Output headroom added when the request omits `max_tokens`. |
-| `thresholds` | list | *(absent)* | `THRESHOLDS_JSON` | **Optional** tiered policy. With no tiers the tiered layer always allows; autoconfig runs regardless. See below. |
-| `target_kv_cache_pct` | number | `85.0` | `TARGET_KV_CACHE_PCT` | Autoconfig: target KV-cache **percentage (0–100)** the remaining-KV counter anchors up to. Finite, `(0, 100]`. |
-| `retry_min_s` | int | `5` | `RETRY_MIN_S` | Autoconfig: minimum `Retry-After` seconds. `>= 1`. |
-| `retry_max_s` | int | `60` | `RETRY_MAX_S` | Autoconfig: maximum `Retry-After` seconds. `>= retry_min_s`. |
-| `token_margin` | number | `1.25` | `TOKEN_MARGIN` | Autoconfig: conservatism multiplier on estimated context tokens. Finite, `>= 1.0`. |
+| `metrics_poll_interval_s` | float | `2.0` | — | How often **each backend's** `/metrics` is polled (one poller per backend, one GET per tick). |
+| `stale_after_s` | float | `6.0` | — | Age after which a backend's cached value is treated as unknown (fail-open for that backend). |
+| `model_refresh_interval_s` | float | `30.0` | `MODEL_REFRESH_INTERVAL_S` | How often **each backend's** `GET /v1/models` is re-fetched (model discovery; the first fetch is immediate). |
+| `chars_per_token` | int | `4` | — | Heuristic divisor for prompt token estimation (global — not per-backend). |
+| `default_max_tokens` | int | `256` | — | Output headroom added when the request omits `max_tokens` (global — not per-backend). |
+| `thresholds` | list | *(absent)* | `THRESHOLDS_JSON` | **Optional** global-default tiered policy. With no tiers the tiered layer always allows; autoconfig runs regardless. A backend may override it per-backend. See below. |
+| `target_kv_cache_pct` | number | `85.0` | `TARGET_KV_CACHE_PCT` | Autoconfig global default: target KV-cache **percentage (0–100)** the remaining-KV counter anchors up to. Finite, `(0, 100]`. Per-backend overridable. |
+| `retry_min_s` | int | `5` | `RETRY_MIN_S` | Autoconfig global default: minimum `Retry-After` seconds. `>= 1`. Per-backend overridable. |
+| `retry_max_s` | int | `60` | `RETRY_MAX_S` | Autoconfig global default: maximum `Retry-After` seconds. `>= retry_min_s`. Per-backend overridable. |
+| `token_margin` | number | `1.25` | `TOKEN_MARGIN` | Autoconfig global default: conservatism multiplier on estimated context tokens. Finite, `>= 1.0`. Per-backend overridable. |
+
+> **Removed:** the legacy `vllm_host`/`vllm_port` config keys and the
+> `VLLM_HOST`/`VLLM_PORT` env vars (the single-backend shorthand) are **gone**.
+> A config file containing `vllm_host` or `vllm_port` fails at startup with a
+> migration-hint error naming `backends`/`BACKENDS_JSON`. A legacy `VLLM_HOST`
+> / `VLLM_PORT` env var is simply **ignored** (it is no longer read).
+
+### `backends` entry contract (required)
+
+`backends` is a **required, non-empty** list. Each entry is an object with:
+
+| Field | Type | Constraint | Meaning |
+|---|---|---|---|
+| `name` | string | non-empty; **unique across backends** | Operator-chosen mnemonic (used in logs, `/healthz`, `/metrics` labels, the 429 message). |
+| `host` | string | non-empty | Hostname of the vLLM server (API + `/metrics` + `/v1/models`). |
+| `port` | int | `1 <= port <= 65535` | Port of the vLLM server. |
+| `models` | list of strings | *(optional)*; ids **globally unique across backends** | The backend's owned model ids (mnemonic + validation anchor). **Omit (or leave empty) to auto-adopt** the served set from the backend's `GET /v1/models`. When present and non-empty it **wins** over discovery. |
+| `default` | bool | *(optional, default `false`)*; **at most one `true` across backends** | The fallback backend for unknown/unparseable models. If none is flagged, the **first** entry is the default. |
+| `thresholds` | list | *(optional)*; same entry contract as the global `thresholds` | Per-backend tiered policy. `null`/omitted ⇒ the global `thresholds`. |
+| `target_kv_cache_pct` | number | *(optional)*; finite, `(0, 100]` | Per-backend override of the global target. Omitted ⇒ global. |
+| `token_margin` | number | *(optional)*; finite, `>= 1.0` | Per-backend override. Omitted ⇒ global. |
+| `retry_min_s` | int | *(optional)*; `>= 1` | Per-backend override. Omitted ⇒ global. |
+| `retry_max_s` | int | *(optional)*; `>= retry_min_s` | Per-backend override. Omitted ⇒ global. (The **effective** pair — override falling back to global — must satisfy `>=`.) |
+
+**Validation (fail-fast at startup):** `backends` non-empty; `name`s unique and
+non-empty; `port` in `[1, 65535]`; **model ids globally unique across
+backends** (a model listed in two backends is a startup error); at most one
+`default: true`; and each per-backend knob, when present, satisfies the same
+ranges as the global default (the effective `retry_max_s >= retry_min_s` rule
+is checked after the per-backend fallback is applied). Any violation aborts
+startup with a clear log line.
+
+> **Model ids are globally unique.** This keeps the `model → backend` map
+> total and the unknown-model fallback unambiguous, and lets the model-keyed
+> stats (`gate_requests_total`, `gate_request_ctx_tokens`) stay model-keyed. A
+> deployment that legitimately serves the same model id on two backends (A/B,
+> canary) is **out of scope** — it would need a routing rule instead of a
+> unique map.
 
 ### `thresholds` entry contract (optional)
 
@@ -356,12 +508,14 @@ entries. Any violation aborts startup with a clear log line.
 
 ## The 429 contract
 
-When a request is rejected by either admission layer the gate responds. The
-`Retry-After` is the **combined** value: when **both** layers reject it is
-`max(tier timeout, autoconfig retry)`; when only one rejects it is that layer's
-value. An autoconfig `Retry-After` is always an **integer within
-`[retry_min_s, retry_max_s]`**, and `remaining <= 0` (cache full /
-over-committed) yields exactly `retry_max_s`.
+When a request is rejected by either admission layer of the **routed
+backend**, the gate responds. The `Retry-After` is the **combined** value: when
+**both** layers reject it is `max(tier timeout, autoconfig retry)`; when only
+one rejects it is that layer's value. An autoconfig `Retry-After` is always an
+**integer within `[retry_min_s, retry_max_s]`** (the routed backend's effective
+values — per-backend override, else the global default), and `remaining <= 0`
+(cache full / over-committed) yields exactly `retry_max_s`. Only the routed
+backend rejects: a request to another, less-full backend is unaffected.
 
 **Tiered rejector** (the tiered layer is the reported rejector):
 
@@ -372,7 +526,7 @@ Content-Type: application/json
 
 {
   "error": {
-    "message": "vLLM KV cache too full for a ~3800-token request (usage 84.0% >= 80% tier; max 1024). Retry in 30s.",
+    "message": "backend qwen (model qwen3-32b): vLLM KV cache too full for a ~3800-token request (usage 84.0% >= 80% tier; max 1024). Retry in 30s.",
     "type": "cache_pressure",
     "code": "kv_cache_too_full"
   }
@@ -388,7 +542,7 @@ Content-Type: application/json
 
 {
   "error": {
-    "message": "vLLM KV cache headroom exhausted for a ~25000-token request (usage 50.0%, ~10000 of 100000 tokens remaining up to the 85% target). Retry in 21s.",
+    "message": "backend qwen (model qwen3-32b): vLLM KV cache headroom exhausted for a ~25000-token request (usage 50.0%, ~10000 of 100000 tokens remaining up to the 85% target). Retry in 21s.",
     "type": "cache_pressure",
     "code": "kv_cache_too_full"
   }
@@ -396,7 +550,9 @@ Content-Type: application/json
 ```
 
 - The **reported rejector** is the layer with the higher timeout when both
-  reject (a tie reports the tiered layer); the message names it.
+  reject (a tie reports the tiered layer); the message names the **routed
+  backend and the request's `model`** (`backend <name> (model <id>): ...`),
+  followed by the rejector-specific text.
 - The body is a small OpenAI-style error envelope so standard SDKs surface it
   cleanly.
 
@@ -406,15 +562,18 @@ Content-Type: application/json
 
 | Method & path | Behavior |
 |---|---|
-| `POST /v1/chat/completions` | Gated, then proxied to vLLM (SSE streaming supported). |
-| `POST /v1/completions` | Gated, then proxied to vLLM. |
-| `GET /healthz` | Liveness (always 200; readiness info in body). |
+| `POST /v1/chat/completions` | Gated (per the routed backend), then proxied to that backend (SSE streaming supported). |
+| `POST /v1/completions` | Gated (per the routed backend), then proxied to that backend. |
+| `GET /v1/models` | Gate-local **aggregate** of the known models of all backends — one entry per model with an `owned_by` field naming the owning backend (always 200, never 429, **not** proxied). |
+| `GET /healthz` | Liveness (always 200; per-backend readiness info + the known models in body). |
 | `GET /metrics` | Gate-local Prometheus stats (see [Observability](#observability)); **not** proxied. |
 | anything else | `404`. |
 
 The proxy forwards method, path, query, headers (minus hop-by-hop), and body
-verbatim, and propagates upstream status codes — a vLLM 5xx surfaces as a 5xx,
-never masked by the gate.
+verbatim to the **routed backend's** `base_url`, and propagates upstream status
+codes — a vLLM 5xx surfaces as a 5xx, never masked by the gate. The backends'
+own `/v1/models` endpoints are **not** reachable through the gate — the gate's
+own `GET /v1/models` is the only model-listing endpoint on the gate.
 
 ---
 
@@ -424,9 +583,10 @@ The gate exposes its own stats at `GET /metrics` — HTTP 200 with
 `Content-Type: text/plain; version=0.0.4; charset=utf-8`, body in the
 Prometheus text exposition format (the same shape vLLM emits). It is a
 gate-local endpoint like `/healthz`, **not proxied** — do not confuse the two:
-the background poller scrapes **vLLM's** `/metrics` (on vLLM's port), while the
-gate's `GET /metrics` (on the gate's port) serves the gate's own `gate_*`
-metrics. They are different endpoints and different Prometheus scrape targets.
+the per-backend pollers scrape **each vLLM backend's** `/metrics` (on the
+backend's port), while the gate's `GET /metrics` (on the gate's port) serves
+the gate's own `gate_*` metrics. They are different endpoints and different
+Prometheus scrape targets.
 
 - **In-memory only, resets on restart.** All `gate_*` metrics live in memory
   and reset when the process restarts. That is by design: Prometheus
@@ -445,17 +605,18 @@ metrics. They are different endpoints and different Prometheus scrape targets.
 |---|---|---|---|
 | `gate_requests_total` | Counter | `endpoint` (`chat_completions` \| `completions`), `model` (the request body's `model` field, else `unknown`), `result` (`forwarded` \| `rejected`) | Generation requests the gate decided, scoped to the two generation endpoints (404s, `/healthz`, and `/metrics` are not counted). |
 | `gate_request_ctx_tokens` | Histogram | `model`, `result` | Estimated context tokens (prompt + headroom) of each request. Median via `histogram_quantile(0.5, ...)`. Buckets: 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144. |
-| `gate_kv_cache_usage_pct` | Gauge | `model_name` (vLLM's `model_name` label; `default` when the series is unlabeled) | Current KV-cache fill **percentage (0–100)** per served model (vLLM's real metric, converted from the fraction). |
-| `gate_kv_cache_remaining_tokens` | Gauge | (none) | The gate's **own live estimate** of remaining KV-cache tokens up to the target (post-subtraction, pre-reanchor); `NaN` until the first anchor. Distinct from `gate_kv_cache_usage_pct` — this is the gate's estimate, not vLLM's real usage. |
-| `gate_config_info` | Info | one label per config field + `thresholds_json` | The loaded configuration, set once at startup. |
-| `gate_metrics_fresh` | Gauge | (none) | `1` if the vLLM metrics feed is fresh, `0` if stale or never fetched. |
-| `gate_metrics_age_s` | Gauge | (none) | Seconds since the last successful vLLM `/metrics` fetch; `NaN` if never fetched. |
+| `gate_kv_cache_usage_pct` | Gauge | `model_name` (vLLM's `model_name` label; `default` when the series is unlabeled) | Current KV-cache fill **percentage (0–100)** per served model (vLLM's real metric, converted from the fraction). The gate **unions all backends' per-model breakdowns** on each render; model ids are globally unique across backends, so a key can only repeat for the synthetic `default` label (the per-backend max wins). |
+| `gate_kv_cache_remaining_tokens` | Gauge | `backend` | The gate's **own live estimate** of remaining KV-cache tokens up to that backend's target (post-subtraction, pre-reanchor); `NaN` until the first anchor. Distinct from `gate_kv_cache_usage_pct` — this is the gate's estimate, not vLLM's real usage. |
+| `gate_backend_capacity_unavailable` | Gauge | `backend` | `1` if that backend's observed (HTTP 200) `/metrics` body lacks a usable KV-cache capacity (its autoconfig layer fails open — see the [capacity-missing caveat](#capacity-missing-caveat-per-backend-fail-open)), `0` otherwise. Alert on this. |
+| `gate_config_info` | Info | one label per config field + `thresholds_json` + `backends_json` | The loaded configuration, set once at startup. `backends_json` serializes the backend structure (per backend: `name`, `host`, `port`, `default`, and which knobs are overridden per-backend) but **not** the `models` lists (discovered data would go stale). |
+| `gate_metrics_fresh` | Gauge | `backend` | `1` if that backend's metrics feed is fresh, `0` if stale or never fetched. |
+| `gate_metrics_age_s` | Gauge | `backend` | Seconds since the last successful `/metrics` fetch for that backend; `NaN` if never fetched. |
 
 **Two model namespaces, kept distinct.** `model` is the OpenAI request body's
-`model` field (the client's model name — the future multi-server routing key).
-`model_name` is vLLM's served-model label. They are different strings on
-different metrics with different label names; do not conflate them in queries
-or dashboards.
+`model` field (the client's model name — **the routing key** that selects the
+backend). `model_name` is vLLM's served-model label. They are different strings
+on different metrics with different label names; do not conflate them in
+queries or dashboards.
 
 ### PromQL examples
 
@@ -472,10 +633,13 @@ histogram_quantile(0.5, sum by (model) (gate_request_ctx_tokens_bucket{result="f
 histogram_quantile(0.5, sum by (model) (gate_request_ctx_tokens_bucket{result="rejected"}))
 # current per-model KV-cache fill %
 gate_kv_cache_usage_pct
-# the gate's own live estimate of remaining KV tokens (NaN until anchored)
+# the gate's own live estimate of remaining KV tokens per backend (NaN until anchored)
 gate_kv_cache_remaining_tokens
-# is the upstream metrics feed healthy?
+# per-backend feed health / age
 gate_metrics_fresh
+gate_metrics_age_s
+# alert: which backend cannot anchor its counter (capacity missing)?
+gate_backend_capacity_unavailable == 1
 ```
 
 > **Median is derived, not exposed.** The gate exposes a histogram;
@@ -499,20 +663,27 @@ scrape_configs:
 
 ## Operational notes
 
-- **Fail-open is intentional.** If you stop or lose the vLLM `/metrics`
-  endpoint, the gate keeps forwarding (it cannot measure headroom, so it does
-  not block). Watch the warning logs and the `metrics_age_s` in `/healthz`.
-- **Fail-closed is the one exception.** A *live* vLLM whose `/metrics` body
-  lacks a usable KV-cache capacity (the `vllm:kv_cache_size_tokens` gauge or
-  the `kv_cache_size_tokens` label on `vllm:cache_config_info`) cannot anchor
-  the remaining-KV counter, so the gate logs an error and exits with status 1
-  (an orchestrator restarts it).
-  An unreachable or stale feed is never fatal — that path fails open. See the
-  [fail-closed caveat](#fail-closed-caveat).
-- **Startup log.** On a successful config load the gate logs the active
-  autoconfig policy — `autoconfig: target 85.0% KV cache, token margin 1.25,
-  retry 5-60s` — and the tiered policy: `tiered policy: 2 threshold tier(s)`
-  (or `tiered policy: none — autoconfig only`).
+- **Fail-open is intentional, per backend.** If you stop or lose one backend's
+  `/metrics` endpoint, the gate keeps forwarding requests routed to that
+  backend (it cannot measure headroom, so it does not block); the other
+  backends are unaffected. Watch the warning logs and the per-backend
+  `metrics_age_s` / `kv_usage` in `/healthz`.
+- **Capacity-missing is per-backend fail-open (not fatal).** A *live* vLLM
+  backend whose `/metrics` body lacks a usable KV-cache capacity (the
+  `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
+  `vllm:cache_config_info`) cannot anchor **that backend's** remaining-KV
+  counter: the gate logs an error, that backend's autoconfig layer fails open,
+  and the `gate_backend_capacity_unavailable{backend}` gauge is set to `1`.
+  The process does **not** exit and the other backends keep gating normally.
+  An unreachable or stale feed is likewise never fatal — that path fails open.
+  See the [capacity-missing
+  caveat](#capacity-missing-caveat-per-backend-fail-open).
+- **Startup log.** On a successful config load the gate logs **one INFO line
+  per backend** — `backend 'qwen' (vllm-qwen:8000) [default]: 2 tier(s), target
+  85.0%, margin 1.25, retry 5-60s` — where the tier count is the effective
+  tiered policy for that backend (`N tier(s)` or `none — autoconfig only`) and
+  the four autoconfig knobs carry an `(override)` mark when the value is
+  per-backend (an unmarked value is the global default).
 - **Estimation is conservative.** The gate over-estimates token counts, so it
   may reject a request that vLLM would actually have fit. Tune
   `chars_per_token` and `default_max_tokens` to your workload if you see
@@ -520,24 +691,34 @@ scrape_configs:
 - **No auth, no TLS termination (v1).** The gate trusts the deployment network
   and is a drop-in front of vLLM. Put it behind your existing ingress/auth if
   you need it.
-- **Logging.** Structured `logging` at INFO; one line per decision
-  (`usage_pct`, `ctx_tokens`, `active_tier`, `allow/reject`, `retry_after`).
-  Prompt text is never logged.
+- **Logging.** Structured `logging` at INFO: one line per reject decision
+  (`reject backend=… reason=… usage_pct=… ctx_tokens=… retry_after=…` — the
+  backend is the routed backend), poller warnings (failed fetches, failed
+  model discovery, the capacity-missing error), and the per-backend startup
+  lines. Prompt text is never logged.
 - **Observability.** The gate exposes its own stats at `GET /metrics`
   (Prometheus text format) — forwarded/rejected counts, request-size
-  histograms, per-model KV-cache fill, loaded config, and feed freshness. See
-  the [Observability](#observability) section for the metric reference and
-  ready-to-paste PromQL.
+  histograms, per-model KV-cache fill, per-backend remaining/freshness/age
+  gauges, the per-backend capacity-unavailable alert gauge, and the loaded
+  config. See the [Observability](#observability) section for the metric
+  reference and ready-to-paste PromQL.
 
 ---
 
 ## Limitations & v2 roadmap
 
-- **Single instance only.** v1 assumes one vLLM backend and takes the max
-  across `model_name` series. Multi-instance monitoring keyed by `model_name`
-  (per-model thresholds and routing) is the flagship v2 item.
-- **Heuristic sizing.** No exact tokenization in v1 (no tokenizer dependency).
-- **No auth / TLS / load-balancing / request queuing** in v1.
+- **Policy is per backend, not per model.** Admission state and policy
+  (thresholds, the four autoconfig knobs) are scoped per backend: models on
+  one backend share its KV pool (single-engine vLLM) and are treated the same.
+  Per-model thresholds (independent policy per model on a shared-KV backend)
+  are not supported; routing *by* model is implemented.
+- **Duplicate model ids across backends are out of scope.** Model ids must be
+  unique across all backends (A/B or canary serving of the same id on two
+  backends would need a routing rule).
+- **Token estimation is global.** `chars_per_token` / `default_max_tokens` are
+  not per-backend knobs in this version.
+- **Heuristic sizing.** No exact tokenization (no tokenizer dependency).
+- **No auth / TLS / load-balancing / request queuing.**
 
 ---
 
@@ -554,9 +735,10 @@ pytest --cov=gate --cov-fail-under=80   # 80% coverage gate
 docker build -t vllm-gate .        # container build (no push)
 ```
 
-The test suite (`tests/test_api.py`) drives the gate end-to-end against a fake
-vLLM (`httpx.ASGITransport` + a mock upstream transport), so the allow / 429 /
-fail-open / streaming paths are all exercised without a real model or GPU.
+The test suite (`tests/test_api.py`) drives the gate end-to-end against fake
+vLLMs (`httpx.ASGITransport` + a mock upstream transport — including
+two-backends routing cases), so the allow / 429 / fail-open / streaming /
+routing paths are all exercised without a real model or GPU.
 
 ### CI / local parity
 

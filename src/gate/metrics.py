@@ -281,17 +281,6 @@ class CapacityCache:
         return (time.monotonic() if now is None else now) - self._fetched_at
 
 
-class CapacityUnavailableError(RuntimeError):
-    """Raised by the poller when an observed ``/metrics`` body lacks a usable KV-cache capacity.
-
-    A live vLLM whose body lacks a usable KV-cache capacity (the standalone
-    ``vllm:kv_cache_size_tokens`` gauge or the ``kv_cache_size_tokens`` label
-    on ``vllm:cache_config_info``) cannot anchor the remaining-KV counter, so
-    the gate fails closed (the app exits with status 1). A merely unreachable
-    vLLM never raises this — that path fails open (invariant #1).
-    """
-
-
 class KvRemaining:
     """In-memory estimate of the KV tokens still available up to the target.
 
@@ -312,6 +301,16 @@ class KvRemaining:
     def reanchor(self, tokens: int) -> None:
         """Reset the estimate to ``tokens`` (poller, each good poll)."""
         self._value = tokens
+
+    def unanchor(self) -> None:
+        """Reset to the never-anchored state (poller, on a capacity-missing observed body).
+
+        The autoconfig layer fails open while the counter is unanchored
+        (``decision_auto`` allows with reason ``auto_unanchored``), so a stale
+        anchor from an earlier good poll can never drive a real (fail-closed)
+        decision off stale data.
+        """
+        self._value = None
 
     def subtract(self, tokens: int) -> None:
         """Charge ``tokens`` to the estimate (app, on every forwarded request).

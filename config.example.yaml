@@ -1,25 +1,71 @@
 # Gate configuration — reference example.
 #
 # The gate reads /etc/gate/config.yaml by default; mount this file there (or
-# pass an explicit path to load_config). All keys are optional; defaults fill
-# any that are absent. The gate runs with zero configuration (only the vLLM
-# host/port is required) — autoconfig is always on.
+# pass an explicit path to load_config). Most keys are optional with sane
+# defaults — EXCEPT `backends`, which is REQUIRED: the gate has no other way
+# to learn its upstream, so at least one backend (name + host + port) must
+# always be configured (file key `backends` or the BACKENDS_JSON env var).
 #
 # NOTE: kv_pct is a percentage (0-100). The vLLM metric is a fraction (0-1);
 # the gate multiplies it by 100 before comparing.
-vllm_host: vllm
-vllm_port: 8000
+#
+# The legacy vllm_host/vllm_port keys (and the VLLM_HOST/VLLM_PORT env vars)
+# are REMOVED: a config containing them fails with a migration-hint error.
+
+# Backends — REQUIRED (env override: BACKENDS_JSON, a JSON list; env wins and
+# replaces this list entirely). Each entry needs a unique non-empty `name`, a
+# `host`, and a `port`. `models:` is OPTIONAL — the served model ids (as
+# exposed by the backend's /v1/models, which also labels its
+# vllm:kv_cache_usage_perc series). Omit (or leave empty) to auto-adopt
+# whatever the backend serves. Model ids must be unique across ALL backends.
+# At most one backend may be `default: true` (the fallback for unknown
+# models; the first backend when none is flagged). All per-backend knobs are
+# optional and default to the global values below.
+backends:
+  - name: qwen
+    host: vllm-qwen
+    port: 8000
+    models: [qwen3-32b]      # mnemonic + validation anchor (optional)
+    default: true
+    # Per-backend overrides (all optional — the globals below are the
+    # defaults; an omitted key inherits the global value):
+    # thresholds:
+    #   - kv_pct: 80
+    #     max_context: 8192
+    #     timeout_s: 30
+    # target_kv_cache_pct: 80.0
+    # token_margin: 1.5
+    # retry_min_s: 10
+    # retry_max_s: 120
+  - name: llama
+    host: vllm-llama
+    port: 8001
+    # no models: => auto-adopt from /v1/models; no overrides => global policy
+
+# Where the gate listens.
+# (env overrides: LISTEN_HOST, LISTEN_PORT)
 listen_host: 0.0.0.0
 listen_port: 8000
+
+# How often each backend's /metrics is polled (one poller per backend, one
+# GET per tick).
 metrics_poll_interval_s: 2.0
+# Age after which a backend's cached value is treated as unknown (fail-open
+# for that backend).
 stale_after_s: 6.0
+# How often each backend's GET /v1/models is re-fetched (model discovery; the
+# first fetch is immediate). (env override: MODEL_REFRESH_INTERVAL_S)
+model_refresh_interval_s: 30.0
+
+# Token estimation (global — not per-backend).
 chars_per_token: 4
 default_max_tokens: 256
 
-# Tiered policy — OPTIONAL (env override: THRESHOLDS_JSON, a JSON list).
-# Highest tier only: when usage crosses several thresholds the one with the
-# largest kv_pct governs. With no tiers the tiered layer always allows; the
-# always-on autoconfig layer below still gates every request.
+# Global default tiered policy — OPTIONAL (env override: THRESHOLDS_JSON, a
+# JSON list). A backend may override this per-backend. Highest tier only:
+# when usage crosses several thresholds the one with the largest kv_pct
+# governs. With no tiers the tiered layer always allows; the always-on
+# autoconfig layer still gates every request.
 thresholds:
   - kv_pct: 50
     max_context: 4096
@@ -28,7 +74,8 @@ thresholds:
     max_context: 1024
     timeout_s: 30
 
-# Autoconfig (always on) — all optional, defaults shown.
+# Global defaults for the autoconfig (always on) knobs — all optional,
+# defaults shown. A backend may override any of them per-backend.
 # target_kv_cache_pct: target KV-cache percentage (0-100) the remaining-KV
 #   counter anchors headroom up to. Finite, (0, 100].
 #   (env override: TARGET_KV_CACHE_PCT)

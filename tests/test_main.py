@@ -4,30 +4,31 @@ Covers the wiring contract of ``main()``: a ``ConfigError`` exits non-zero,
 the happy path builds the app via ``create_app`` with ``start_poller=True``
 and hands it to ``uvicorn.run`` with the configured listen host/port, the
 ``LOG_LEVEL`` env var is forwarded to uvicorn, and the startup INFO log
-reports the autoconfig knobs and the tiered tier count (or the none case).
-Uvicorn itself is recorded, not run.
+reports one line per backend (name, host:port, default flag, tier count,
+and the four autoconfig knobs with per-backend overrides marked). Uvicorn
+itself is recorded, not run.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import pytest
 
 import gate.main as main_mod
-from gate.config import ConfigError, GateConfig, Threshold
+from gate.config import Backend, ConfigError, GateConfig, Threshold
 
 
 def make_cfg() -> GateConfig:
-    """A realistic config with two thresholds."""
+    """A realistic config: one default backend with two global thresholds."""
     return GateConfig(
-        vllm_host="vllm",
-        vllm_port=9000,
         listen_host="127.0.0.1",
         listen_port=8080,
         metrics_poll_interval_s=1.5,
         stale_after_s=4.0,
         thresholds=(Threshold(50.0, 4096, 15), Threshold(80.0, 1024, 30)),
+        backends=(Backend(name="vllm", host="vllm", port=9000, default=True),),
     )
 
 
@@ -52,11 +53,8 @@ def test_happy_path_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     created: dict = {}
     sentinel_app = object()
 
-    def fake_create_app(
-        cfg_arg: GateConfig, *, cache: object, upstream: object, start_poller: bool
-    ) -> object:
+    def fake_create_app(cfg_arg: GateConfig, *, upstream: object, start_poller: bool) -> object:
         created["cfg"] = cfg_arg
-        created["cache"] = cache
         created["upstream"] = upstream
         created["start_poller"] = start_poller
         return sentinel_app
@@ -80,10 +78,10 @@ def test_happy_path_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
 
     main_mod.main()
 
-    # create_app wiring contract.
+    # create_app wiring contract (per-backend state is built internally;
+    # main only supplies the shared upstream client).
     assert created["cfg"] is cfg
     assert created["start_poller"] is True
-    assert isinstance(created["cache"], main_mod.MetricsCache)
     assert isinstance(created["upstream"], FakeClient)
 
     # uvicorn.run received the app create_app returned, with listen host/port.
@@ -143,33 +141,65 @@ def _stub_uvicorn_and_deps(monkeypatch: pytest.MonkeyPatch, cfg: GateConfig) -> 
     monkeypatch.setattr(main_mod.uvicorn, "run", lambda _app, **_kw: None)
 
 
-def test_startup_logs_autoconfig_knobs_and_no_tiers(
+def test_startup_logs_one_line_per_backend(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A zero-config (no thresholds) startup logs the autoconfig knobs and
-    the 'none — autoconfig only' tier line at INFO."""
-    cfg = GateConfig(vllm_host="vllm", vllm_port=9000)
+    """A no-thresholds startup logs one INFO line per backend: name,
+    host:port, the default flag, the 'none — autoconfig only' tier text, and
+    the global autoconfig knobs (unmarked)."""
+    cfg = GateConfig(backends=(Backend(name="vllm", host="vllm", port=9000, default=True),))
     _stub_uvicorn_and_deps(monkeypatch, cfg)
 
     with caplog.at_level(logging.INFO, logger="gate.main"):
         main_mod.main()
 
     messages = [r.message for r in caplog.records if r.name == "gate.main"]
-    assert "autoconfig: target 85.0% KV cache, token margin 1.25, retry 5-60s" in messages
-    assert "tiered policy: none — autoconfig only" in messages
+    assert (
+        "backend 'vllm' (vllm:9000) [default]: none — autoconfig only, "
+        "target 85.0%, margin 1.25, retry 5-60s" in messages
+    )
     assert all(r.levelno == logging.INFO for r in caplog.records if r.name == "gate.main")
 
 
-def test_startup_logs_tier_count(
+def test_startup_logs_inherited_global_tier_count(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A config with N thresholds logs the N-tier line at INFO."""
-    cfg = make_cfg()  # two thresholds
+    """A backend with no per-backend thresholds inherits the global tiers;
+    the startup line logs that tier count, not 'none — autoconfig only'."""
+    cfg = make_cfg()  # two global thresholds, backend thresholds=None
+    assert cfg.backends[0].thresholds is None
     _stub_uvicorn_and_deps(monkeypatch, cfg)
 
     with caplog.at_level(logging.INFO, logger="gate.main"):
         main_mod.main()
 
     messages = [r.message for r in caplog.records if r.name == "gate.main"]
-    assert "autoconfig: target 85.0% KV cache, token margin 1.25, retry 5-60s" in messages
-    assert "tiered policy: 2 threshold tier(s)" in messages
+    assert (
+        "backend 'vllm' (vllm:9000) [default]: 2 tier(s), "
+        "target 85.0%, margin 1.25, retry 5-60s" in messages
+    )
+
+
+def test_startup_logs_tier_count_and_overrides(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A config with per-backend thresholds and knob overrides logs the
+    tier count and the '(override)' markers at INFO."""
+    cfg = make_cfg()  # two global thresholds
+    overridden = replace(
+        cfg.backends[0],
+        thresholds=(Threshold(50.0, 4096, 15), Threshold(80.0, 1024, 30)),
+        target_kv_cache_pct=80.0,
+        token_margin=1.2,
+    )
+    cfg = replace(cfg, backends=(overridden,))
+    _stub_uvicorn_and_deps(monkeypatch, cfg)
+
+    with caplog.at_level(logging.INFO, logger="gate.main"):
+        main_mod.main()
+
+    messages = [r.message for r in caplog.records if r.name == "gate.main"]
+    assert (
+        "backend 'vllm' (vllm:9000) [default]: 2 tier(s), target 80.0% (override), "
+        "margin 1.2 (override), retry 5-60s" in messages
+    )

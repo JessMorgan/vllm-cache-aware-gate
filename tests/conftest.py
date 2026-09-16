@@ -6,8 +6,7 @@ import pytest
 import yaml
 
 SAMPLE_CONFIG: dict = {
-    "vllm_host": "vllm",
-    "vllm_port": 9000,
+    "backends": [{"name": "vllm", "host": "vllm", "port": 9000, "default": True}],
     "listen_host": "127.0.0.1",
     "listen_port": 8080,
     "metrics_poll_interval_s": 1.5,

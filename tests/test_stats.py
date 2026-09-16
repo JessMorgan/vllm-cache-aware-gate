@@ -1,21 +1,27 @@
-"""Tests for gate.stats: GateStats metrics and Prometheus rendering."""
+"""Tests for gate.stats: GateStats metrics and Prometheus rendering.
+
+Covers the multi-backend additions (docs/plans/multi-backend.md §2.5): the
+``backend`` label on the feed/remaining gauges, the
+``gate_backend_capacity_unavailable`` gauge, and the ``gate_config_info``
+backend-structure serialization (which omits the ``models:`` lists).
+"""
 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from prometheus_client import CollectorRegistry
 from prometheus_client.parser import text_string_to_metric_families
 
-from gate.config import GateConfig, Threshold
+from gate.config import Backend, GateConfig, Threshold
 from gate.stats import GateStats
 
 
 def make_config() -> GateConfig:
-    """A GateConfig with two tiers (50/4096/15, 80/1024/30)."""
+    """A single-backend GateConfig (decision 6) with two tiers (50/4096/15,
+    80/1024/30)."""
     return GateConfig(
-        vllm_host="vllm",
-        vllm_port=9000,
         listen_host="127.0.0.1",
         listen_port=8080,
         metrics_poll_interval_s=1.5,
@@ -23,6 +29,7 @@ def make_config() -> GateConfig:
         chars_per_token=4,
         default_max_tokens=256,
         thresholds=(Threshold(50.0, 4096, 15), Threshold(80.0, 1024, 30)),
+        backends=(Backend(name="vllm", host="vllm", port=9000, default=True),),
     )
 
 
@@ -125,54 +132,105 @@ class TestKvUsage:
 class TestFreshness:
     def test_fresh(self) -> None:
         stats = make_stats()
-        stats.set_freshness(True, 1.2)
+        stats.set_freshness("qwen", True, 1.2)
         text = stats.render().decode()
-        assert "gate_metrics_fresh 1.0" in text
-        assert "gate_metrics_age_s 1.2" in text
+        assert 'gate_metrics_fresh{backend="qwen"} 1.0' in text
+        assert 'gate_metrics_age_s{backend="qwen"} 1.2' in text
 
     def test_stale_never_fetched(self) -> None:
         # age_s=None (never fetched) must render as NaN, not 0.0.
         stats = make_stats()
-        stats.set_freshness(False, None)
+        stats.set_freshness("qwen", False, None)
         text = stats.render().decode()
-        assert "gate_metrics_fresh 0.0" in text
-        assert "gate_metrics_age_s NaN" in text
+        assert 'gate_metrics_fresh{backend="qwen"} 0.0' in text
+        assert 'gate_metrics_age_s{backend="qwen"} NaN' in text
+
+    def test_per_backend_series_are_independent(self) -> None:
+        # Each backend gets its own series; one backend's staleness does not
+        # affect the other's.
+        stats = make_stats()
+        stats.set_freshness("qwen", True, 1.2)
+        stats.set_freshness("llama", False, None)
+        text = stats.render().decode()
+        assert 'gate_metrics_fresh{backend="qwen"} 1.0' in text
+        assert 'gate_metrics_fresh{backend="llama"} 0.0' in text
+        assert 'gate_metrics_age_s{backend="qwen"} 1.2' in text
+        assert 'gate_metrics_age_s{backend="llama"} NaN' in text
 
     def test_initial_state_before_set_freshness(self) -> None:
-        # Before any set_freshness, age must be NaN (not 0.0) and fresh must be 0.0.
+        # Before any set_freshness, no per-backend SAMPLE exists yet (the
+        # family's HELP/TYPE lines always render). Each backend is set on
+        # every /metrics render.
         stats = make_stats()
-        text = stats.render().decode()
-        assert "gate_metrics_fresh 0.0" in text
-        assert "gate_metrics_age_s NaN" in text
+        for family in text_string_to_metric_families(stats.render().decode()):
+            if family.name in ("gate_metrics_fresh", "gate_metrics_age_s"):
+                assert list(family.samples) == []
 
 
 class TestRemaining:
     def test_sets_value(self) -> None:
         stats = make_stats()
-        stats.set_remaining(123)
+        stats.set_remaining("qwen", 123)
         text = stats.render().decode()
-        assert "gate_kv_cache_remaining_tokens 123.0" in text
+        assert 'gate_kv_cache_remaining_tokens{backend="qwen"} 123.0' in text
 
     def test_sets_negative_value(self) -> None:
         # An over-committed counter renders its negative value.
         stats = make_stats()
-        stats.set_remaining(-5)
+        stats.set_remaining("qwen", -5)
         text = stats.render().decode()
-        assert "gate_kv_cache_remaining_tokens -5.0" in text
+        assert 'gate_kv_cache_remaining_tokens{backend="qwen"} -5.0' in text
 
     def test_none_renders_nan(self) -> None:
         # None (never anchored) must render as NaN, not 0.0.
         stats = make_stats()
-        stats.set_remaining(123)
-        stats.set_remaining(None)
+        stats.set_remaining("qwen", 123)
+        stats.set_remaining("qwen", None)
         text = stats.render().decode()
-        assert "gate_kv_cache_remaining_tokens NaN" in text
+        assert 'gate_kv_cache_remaining_tokens{backend="qwen"} NaN' in text
+
+    def test_per_backend_series_are_independent(self) -> None:
+        stats = make_stats()
+        stats.set_remaining("qwen", 123)
+        stats.set_remaining("llama", None)
+        text = stats.render().decode()
+        assert 'gate_kv_cache_remaining_tokens{backend="qwen"} 123.0' in text
+        assert 'gate_kv_cache_remaining_tokens{backend="llama"} NaN' in text
 
     def test_initial_state_before_set_remaining(self) -> None:
-        # Before any set_remaining, the gauge must be NaN (not 0.0).
+        # Before any set_remaining, no per-backend sample exists yet (the
+        # family's HELP/TYPE lines always render).
         stats = make_stats()
+        for family in text_string_to_metric_families(stats.render().decode()):
+            if family.name == "gate_kv_cache_remaining_tokens":
+                assert list(family.samples) == []
+
+
+class TestBackendCapacityUnavailable:
+    def test_set_and_clear(self) -> None:
+        stats = make_stats()
+        stats.set_backend_capacity_unavailable("qwen", True)
         text = stats.render().decode()
-        assert "gate_kv_cache_remaining_tokens NaN" in text
+        assert 'gate_backend_capacity_unavailable{backend="qwen"} 1.0' in text
+        stats.set_backend_capacity_unavailable("qwen", False)
+        text = stats.render().decode()
+        assert 'gate_backend_capacity_unavailable{backend="qwen"} 0.0' in text
+
+    def test_per_backend_independent(self) -> None:
+        stats = make_stats()
+        stats.set_backend_capacity_unavailable("qwen", True)
+        stats.set_backend_capacity_unavailable("llama", False)
+        text = stats.render().decode()
+        assert 'gate_backend_capacity_unavailable{backend="qwen"} 1.0' in text
+        assert 'gate_backend_capacity_unavailable{backend="llama"} 0.0' in text
+
+    def test_initial_state_before_set(self) -> None:
+        # The app sets every backend on each render; before that the family
+        # has no samples (the HELP/TYPE lines always render).
+        stats = make_stats()
+        for family in text_string_to_metric_families(stats.render().decode()):
+            if family.name == "gate_backend_capacity_unavailable":
+                assert list(family.samples) == []
 
 
 class TestConfigInfo:
@@ -180,14 +238,12 @@ class TestConfigInfo:
         stats = make_stats()
         text = stats.render().decode()
         assert "gate_config_info{" in text
-        assert 'vllm_host="vllm"' in text
         assert "thresholds_json=" in text
+        assert "backends_json=" in text
 
     def test_label_values(self) -> None:
         stats = make_stats()
         labels = _config_labels(stats)
-        assert labels["vllm_host"] == "vllm"
-        assert labels["vllm_port"] == "9000"
         assert labels["listen_host"] == "127.0.0.1"
         assert labels["listen_port"] == "8080"
         assert labels["metrics_poll_interval_s"] == "1.5"
@@ -196,6 +252,78 @@ class TestConfigInfo:
         assert labels["default_max_tokens"] == "256"
         # Compact JSON of the two thresholds as [kv_pct, max_context, timeout_s].
         assert labels["thresholds_json"] == json.dumps([[50.0, 4096, 15], [80.0, 1024, 30]])
+        # The removed vllm_host/vllm_port labels are gone (decision 6).
+        assert "vllm_host" not in labels
+        assert "vllm_port" not in labels
+
+    def test_backends_json_single_backend(self) -> None:
+        # make_config() has one backends entry; it is serialized with its
+        # name/host/port/default flag and no overrides.
+        stats = make_stats()
+        labels = _config_labels(stats)
+        backends = json.loads(labels["backends_json"])
+        assert backends == [
+            {
+                "name": "vllm",
+                "host": "vllm",
+                "port": 9000,
+                "default": True,
+                "overrides": [],
+            }
+        ]
+
+    def test_backends_json_serializes_structure_and_overrides(self) -> None:
+        from gate.config import Backend
+
+        cfg = make_config()
+        cfg = replace(
+            cfg,
+            backends=(
+                Backend(
+                    name="qwen",
+                    host="vllm-qwen",
+                    port=8000,
+                    models=("qwen3-32b",),
+                    default=True,
+                    target_kv_cache_pct=80.0,
+                    token_margin=1.5,
+                ),
+                Backend(name="llama", host="vllm-llama", port=8001),
+            ),
+        )
+        stats = GateStats(cfg, registry=CollectorRegistry())
+        labels = _config_labels(stats)
+        backends = json.loads(labels["backends_json"])
+        assert backends == [
+            {
+                "name": "qwen",
+                "host": "vllm-qwen",
+                "port": 8000,
+                "default": True,
+                "overrides": ["target_kv_cache_pct", "token_margin"],
+            },
+            {
+                "name": "llama",
+                "host": "vllm-llama",
+                "port": 8001,
+                "default": False,
+                "overrides": [],
+            },
+        ]
+
+    def test_backends_json_omits_model_lists(self) -> None:
+        from gate.config import Backend
+
+        cfg = make_config()
+        cfg = replace(
+            cfg,
+            backends=(Backend(name="qwen", host="h", port=1, models=("secret-model",)),),
+        )
+        stats = GateStats(cfg, registry=CollectorRegistry())
+        text = stats.render().decode()
+        # The models: lists are discovered at runtime and must not appear in
+        # the startup-static info metric.
+        assert "secret-model" not in text
 
 
 class TestRender:
