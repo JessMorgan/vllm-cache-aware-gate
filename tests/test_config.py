@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from gate import config
-from gate.config import ConfigError, GateConfig, Threshold, load_config
+from gate.config import Backend, ConfigError, GateConfig, Threshold, load_config
 
 
 def _write(tmp_path, data: object, name: str = "config.yaml") -> str:
@@ -540,3 +540,475 @@ def test_thresholds_still_validated_when_present():
             path=None,
             env=_env_with_thresholds([{"kv_pct": 150, "max_context": 1, "timeout_s": 1}]),
         )
+
+
+# --- backends (multi-backend, additive) ---------------------------------------
+
+
+def _backend_env(backends: list[dict]) -> dict[str, str]:
+    return {"BACKENDS_JSON": json.dumps(backends)}
+
+
+def test_backends_from_yaml(tmp_path):
+    path = _write(
+        tmp_path,
+        {
+            "backends": [
+                {
+                    "name": "qwen",
+                    "host": "vllm-qwen",
+                    "port": 8000,
+                    "models": ["qwen3-32b"],
+                    "default": True,
+                    "target_kv_cache_pct": 80.0,
+                },
+                {"name": "llama", "host": "vllm-llama", "port": 8001},
+            ]
+        },
+    )
+    cfg = load_config(path=path, env={})
+    assert cfg.backends == (
+        Backend(
+            name="qwen",
+            host="vllm-qwen",
+            port=8000,
+            models=("qwen3-32b",),
+            default=True,
+            target_kv_cache_pct=80.0,
+        ),
+        Backend(name="llama", host="vllm-llama", port=8001),
+    )
+
+
+def test_backends_default_empty_tuple():
+    cfg = load_config(path=None, env={})
+    assert cfg.backends == ()
+
+
+def test_backends_json_env_wins_over_file(tmp_path):
+    path = _write(
+        tmp_path,
+        {"backends": [{"name": "from-file", "host": "file-host", "port": 1111, "default": True}]},
+    )
+    env = _backend_env([{"name": "from-env", "host": "env-host", "port": 2222}])
+    cfg = load_config(path=path, env=env)
+    assert cfg.backends == (Backend(name="from-env", host="env-host", port=2222),)
+
+
+def test_backends_per_backend_overrides_parsed():
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "models": ["m1"],
+                "default": True,
+                "thresholds": [{"kv_pct": 50, "max_context": 1024, "timeout_s": 10}],
+                "target_kv_cache_pct": 70.0,
+                "token_margin": 1.5,
+                "retry_min_s": 10,
+                "retry_max_s": 120,
+            }
+        ]
+    )
+    cfg = load_config(path=None, env=env)
+    b = cfg.backends[0]
+    assert b.thresholds == (Threshold(kv_pct=50.0, max_context=1024, timeout_s=10),)
+    assert b.target_kv_cache_pct == 70.0
+    assert b.token_margin == 1.5
+    assert b.retry_min_s == 10
+    assert b.retry_max_s == 120
+
+
+def test_backends_omitted_knobs_are_none():
+    """Per-backend knobs/thresholds omitted parse as None (use global default)."""
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1}])
+    cfg = load_config(path=None, env=env)
+    b = cfg.backends[0]
+    assert b.thresholds is None
+    assert b.target_kv_cache_pct is None
+    assert b.token_margin is None
+    assert b.retry_min_s is None
+    assert b.retry_max_s is None
+    assert b.models == ()
+    assert b.default is False
+
+
+def test_backends_legacy_config_unchanged(tmp_config_file):
+    """A legacy config with no backends key parses exactly as before."""
+    cfg = load_config(path=tmp_config_file, env={})
+    assert cfg.backends == ()
+    assert cfg.vllm_host == "vllm"
+    assert cfg.vllm_port == 9000
+    assert cfg.model_refresh_interval_s == 30.0
+
+
+def test_backends_and_legacy_keys_coexist(tmp_path):
+    """vllm_host/vllm_port remain valid alongside backends (removal is later)."""
+    path = _write(
+        tmp_path,
+        {
+            "vllm_host": "legacy-host",
+            "vllm_port": 9999,
+            "backends": [{"name": "b1", "host": "h1", "port": 1}],
+        },
+    )
+    cfg = load_config(path=path, env={})
+    assert cfg.vllm_host == "legacy-host"
+    assert cfg.vllm_port == 9999
+    assert len(cfg.backends) == 1
+
+
+def test_model_refresh_interval_s_from_file_and_env(tmp_path):
+    path = _write(tmp_path, {"model_refresh_interval_s": 12.5})
+    cfg = load_config(path=path, env={})
+    assert cfg.model_refresh_interval_s == 12.5
+    cfg = load_config(path=None, env={"MODEL_REFRESH_INTERVAL_S": "45.5"})
+    assert cfg.model_refresh_interval_s == 45.5
+
+
+def test_model_refresh_interval_s_zero_raises(tmp_path):
+    path = _write(tmp_path, {"model_refresh_interval_s": 0})
+    with pytest.raises(ConfigError, match="model_refresh_interval_s"):
+        load_config(path=path, env={})
+
+
+def test_model_refresh_interval_s_nan_raises(tmp_path):
+    p = tmp_path / "nan.yaml"
+    p.write_text("model_refresh_interval_s: .nan\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="model_refresh_interval_s"):
+        load_config(path=str(p), env={})
+
+
+def test_model_refresh_interval_s_wrong_type_raises(tmp_path):
+    path = _write(tmp_path, {"model_refresh_interval_s": "30"})
+    with pytest.raises(ConfigError, match="model_refresh_interval_s"):
+        load_config(path=path, env={})
+
+
+def test_backends_json_malformed_json_raises():
+    with pytest.raises(ConfigError, match="BACKENDS_JSON is not valid JSON"):
+        load_config(path=None, env={"BACKENDS_JSON": "{oops"})
+
+
+def test_backends_json_not_a_list_raises():
+    with pytest.raises(ConfigError, match="must be a list"):
+        load_config(path=None, env={"BACKENDS_JSON": '{"name": "x"}'})
+
+
+def test_backends_entry_not_an_object_raises():
+    with pytest.raises(ConfigError, match="entry must be an object"):
+        load_config(path=None, env={"BACKENDS_JSON": "[42]"})
+
+
+def test_backends_unknown_key_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "bogus": True}])
+    with pytest.raises(ConfigError, match="unknown backend key"):
+        load_config(path=None, env=env)
+
+
+def test_backends_missing_name_raises():
+    with pytest.raises(ConfigError, match="'name'"):
+        load_config(path=None, env={"BACKENDS_JSON": '[{"host": "h1", "port": 1}]'})
+
+
+def test_backends_empty_name_raises():
+    env = _backend_env([{"name": "", "host": "h1", "port": 1}])
+    with pytest.raises(ConfigError, match="'name'"):
+        load_config(path=None, env=env)
+
+
+def test_backends_non_string_name_raises():
+    env = _backend_env([{"name": 7, "host": "h1", "port": 1}])
+    with pytest.raises(ConfigError, match="'name'"):
+        load_config(path=None, env=env)
+
+
+def test_backends_missing_host_raises():
+    with pytest.raises(ConfigError, match="'host'"):
+        load_config(path=None, env={"BACKENDS_JSON": '[{"name": "b1", "port": 1}]'})
+
+
+def test_backends_bad_port_type_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": "8000"}])
+    with pytest.raises(ConfigError, match="'port'"):
+        load_config(path=None, env=env)
+
+
+def test_backends_port_out_of_range_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 70000}])
+    with pytest.raises(ConfigError, match="port must be in \\[1, 65535\\]"):
+        load_config(path=None, env=env)
+
+
+def test_backends_port_zero_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 0}])
+    with pytest.raises(ConfigError, match="port must be in \\[1, 65535\\]"):
+        load_config(path=None, env=env)
+
+
+def test_backends_port_boundaries_accepted():
+    """Port exactly 1 and 65535 are accepted (inclusive bounds)."""
+    env = _backend_env(
+        [
+            {"name": "a", "host": "h1", "port": 1},
+            {"name": "b", "host": "h2", "port": 65535},
+        ]
+    )
+    cfg = load_config(path=None, env=env)
+    assert cfg.backends[0].port == 1
+    assert cfg.backends[1].port == 65535
+
+
+def test_backends_per_backend_target_at_100_is_valid():
+    """Per-backend target_kv_cache_pct exactly 100 is accepted."""
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "target_kv_cache_pct": 100}])
+    cfg = load_config(path=None, env=env)
+    assert cfg.backends[0].target_kv_cache_pct == 100.0
+
+
+def test_backends_per_backend_margin_at_one_is_valid():
+    """Per-backend token_margin exactly 1.0 is accepted."""
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "token_margin": 1.0}])
+    cfg = load_config(path=None, env=env)
+    assert cfg.backends[0].token_margin == 1.0
+
+
+def test_backends_per_backend_retry_max_equal_min_is_valid():
+    """Per-backend retry_max_s == retry_min_s is accepted."""
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "retry_min_s": 10,
+                "retry_max_s": 10,
+            }
+        ]
+    )
+    cfg = load_config(path=None, env=env)
+    assert cfg.backends[0].retry_min_s == 10
+    assert cfg.backends[0].retry_max_s == 10
+
+
+def test_backends_duplicate_name_raises():
+    env = _backend_env(
+        [
+            {"name": "same", "host": "h1", "port": 1},
+            {"name": "same", "host": "h2", "port": 2},
+        ]
+    )
+    with pytest.raises(ConfigError, match="duplicate backend name"):
+        load_config(path=None, env=env)
+
+
+def test_backends_model_id_duplicated_across_backends_raises():
+    env = _backend_env(
+        [
+            {"name": "a", "host": "h1", "port": 1, "models": ["shared"]},
+            {"name": "b", "host": "h2", "port": 2, "models": ["shared"]},
+        ]
+    )
+    with pytest.raises(ConfigError, match="unique across backends"):
+        load_config(path=None, env=env)
+
+
+def test_backends_model_id_duplicated_within_backend_raises():
+    env = _backend_env(
+        [
+            {"name": "a", "host": "h1", "port": 1, "models": ["m", "m"]},
+            {"name": "b", "host": "h2", "port": 2, "models": ["other"]},
+        ]
+    )
+    with pytest.raises(ConfigError, match="duplicate model id"):
+        load_config(path=None, env=env)
+
+
+def test_backends_models_not_a_list_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "models": "m1"}])
+    with pytest.raises(ConfigError, match="'models'"):
+        load_config(path=None, env=env)
+
+
+def test_backends_models_empty_string_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "models": [""]}])
+    with pytest.raises(ConfigError, match="models\\[0\\]"):
+        load_config(path=None, env=env)
+
+
+def test_backends_models_non_string_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "models": [7]}])
+    with pytest.raises(ConfigError, match="models\\[0\\]"):
+        load_config(path=None, env=env)
+
+
+def test_backends_two_defaults_raises():
+    env = _backend_env(
+        [
+            {"name": "a", "host": "h1", "port": 1, "default": True},
+            {"name": "b", "host": "h2", "port": 2, "default": True},
+        ]
+    )
+    with pytest.raises(ConfigError, match="at most one backend"):
+        load_config(path=None, env=env)
+
+
+def test_backends_one_default_is_valid():
+    env = _backend_env(
+        [
+            {"name": "a", "host": "h1", "port": 1},
+            {"name": "b", "host": "h2", "port": 2, "default": True},
+        ]
+    )
+    cfg = load_config(path=None, env=env)
+    assert cfg.backends[1].default is True
+
+
+def test_backends_default_not_bool_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "default": "yes"}])
+    with pytest.raises(ConfigError, match="'default'"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_target_out_of_range_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "target_kv_cache_pct": 101}])
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_target_zero_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "target_kv_cache_pct": 0}])
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_target_nan_raises(tmp_path):
+    p = tmp_path / "nan.yaml"
+    p.write_text(
+        "backends:\n  - name: b1\n    host: h1\n    port: 1\n    target_kv_cache_pct: .nan\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=str(p), env={})
+
+
+def test_backends_per_backend_margin_below_one_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "token_margin": 0.9}])
+    with pytest.raises(ConfigError, match="token_margin"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_retry_min_zero_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "retry_min_s": 0}])
+    with pytest.raises(ConfigError, match="retry_min_s"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_retry_max_below_min_raises():
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "retry_min_s": 30,
+                "retry_max_s": 10,
+            }
+        ]
+    )
+    with pytest.raises(ConfigError, match="retry_max_s"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_retry_max_below_global_min_raises():
+    """retry_max_s override below the global retry_min_s is rejected."""
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "retry_max_s": 3,
+            }
+        ]
+    )
+    with pytest.raises(ConfigError, match="retry_max_s"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_retry_min_above_global_max_raises():
+    """retry_min_s override above the global retry_max_s is rejected."""
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "retry_min_s": 120,
+            }
+        ]
+    )
+    with pytest.raises(ConfigError, match="retry_max_s"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_threshold_kv_pct_out_of_range_raises():
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "thresholds": [{"kv_pct": 150, "max_context": 1, "timeout_s": 1}],
+            }
+        ]
+    )
+    with pytest.raises(ConfigError, match="kv_pct"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_threshold_duplicate_kv_pct_raises():
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "thresholds": [
+                    {"kv_pct": 50, "max_context": 1, "timeout_s": 1},
+                    {"kv_pct": 50, "max_context": 2, "timeout_s": 2},
+                ],
+            }
+        ]
+    )
+    with pytest.raises(ConfigError, match="duplicate kv_pct"):
+        load_config(path=None, env=env)
+
+
+def test_backends_per_backend_threshold_bad_shape_raises():
+    env = _backend_env(
+        [
+            {
+                "name": "b1",
+                "host": "h1",
+                "port": 1,
+                "thresholds": [{"kv_pct": 50, "max_context": 1}],
+            }
+        ]
+    )
+    with pytest.raises(ConfigError, match="exactly the keys"):
+        load_config(path=None, env=env)
+
+
+def test_backends_knob_wrong_type_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": 1, "token_margin": "1.5"}])
+    with pytest.raises(ConfigError, match="token_margin"):
+        load_config(path=None, env=env)
+
+
+def test_backends_port_bool_raises():
+    env = _backend_env([{"name": "b1", "host": "h1", "port": True}])
+    with pytest.raises(ConfigError, match="'port'"):
+        load_config(path=None, env=env)

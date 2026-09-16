@@ -3,6 +3,13 @@
 Reads a YAML config file (if any) and applies environment overrides, then
 validates the result. All failures raise :class:`ConfigError` with a clear
 message so startup fails fast.
+
+Multi-backend (additive): the optional ``backends:`` list (file) /
+``BACKENDS_JSON`` (env, wins over the file entirely, mirroring
+``THRESHOLDS_JSON``) configures one or more vLLM backends. Each backend may
+override the tiered ``thresholds`` and the four autoconfig knobs; ``None``
+means "use the global default". The legacy ``vllm_host``/``vllm_port`` keys
+remain valid alongside ``backends:``.
 """
 
 from __future__ import annotations
@@ -12,7 +19,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, TypeGuard
 
 import yaml
 
@@ -34,10 +41,28 @@ _KNOWN_KEYS: frozenset[str] = frozenset(
         "retry_min_s",
         "retry_max_s",
         "token_margin",
+        "backends",
+        "model_refresh_interval_s",
     }
 )
 
 _THRESHOLD_KEYS: frozenset[str] = frozenset({"kv_pct", "max_context", "timeout_s"})
+
+# Known keys inside one ``backends:`` entry.
+_BACKEND_KEYS: frozenset[str] = frozenset(
+    {
+        "name",
+        "host",
+        "port",
+        "models",
+        "default",
+        "thresholds",
+        "target_kv_cache_pct",
+        "token_margin",
+        "retry_min_s",
+        "retry_max_s",
+    }
+)
 
 
 class ConfigError(ValueError):
@@ -58,6 +83,28 @@ class Threshold:
 
 
 @dataclass(frozen=True)
+class Backend:
+    """One configured vLLM backend (multi-backend routing, design plan §2.1).
+
+    ``models`` is an optional mnemonic + validation anchor; an empty tuple
+    means the owned model set is auto-adopted from the backend's
+    ``GET /v1/models``. The four autoconfig knobs and ``thresholds`` are
+    ``None`` when the backend uses the global default value.
+    """
+
+    name: str
+    host: str
+    port: int
+    models: tuple[str, ...] = ()
+    default: bool = False
+    thresholds: tuple[Threshold, ...] | None = None
+    target_kv_cache_pct: float | None = None
+    token_margin: float | None = None
+    retry_min_s: int | None = None
+    retry_max_s: int | None = None
+
+
+@dataclass(frozen=True)
 class GateConfig:
     """Fully validated gate configuration."""
 
@@ -67,6 +114,7 @@ class GateConfig:
     listen_port: int = 8000
     metrics_poll_interval_s: float = 2.0
     stale_after_s: float = 6.0
+    model_refresh_interval_s: float = 30.0
     chars_per_token: int = 4
     default_max_tokens: int = 256
     thresholds: tuple[Threshold, ...] = ()
@@ -74,9 +122,10 @@ class GateConfig:
     retry_min_s: int = 5
     retry_max_s: int = 60
     token_margin: float = 1.25
+    backends: tuple[Backend, ...] = ()
 
 
-def _is_int(value: Any) -> bool:
+def _is_int(value: Any) -> TypeGuard[int]:
     """True for real ints (bool is excluded on purpose)."""
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -112,6 +161,87 @@ def _parse_thresholds(raw: Any, source: str) -> list[Threshold]:
             raise ConfigError(f"{where}: 'timeout_s' must be an integer")
         parsed.append(Threshold(kv_pct=float(kv_pct), max_context=max_context, timeout_s=timeout_s))
     return parsed
+
+
+def _parse_backend_entry(raw: Any, source: str, index: int) -> Backend:
+    """Parse one ``backends:`` entry (mapping) into a Backend.
+
+    ``None`` knob/threshold fields mean "use the global default". Type errors
+    raise :class:`ConfigError`; range/uniqueness checks happen in
+    :func:`_validate` (same split as the scalar keys).
+    """
+    where = f"{source}: backends[{index}]"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: entry must be an object")
+    unknown = set(raw) - _BACKEND_KEYS
+    if unknown:
+        raise ConfigError(f"{where}: unknown backend key(s): {sorted(unknown)}")
+    name = raw.get("name")
+    if not isinstance(name, str) or not name:
+        raise ConfigError(f"{where}: 'name' must be a non-empty string")
+    host = raw.get("host")
+    if not isinstance(host, str) or not host:
+        raise ConfigError(f"{where}: 'host' must be a non-empty string")
+    port = raw.get("port")
+    if not _is_int(port):
+        raise ConfigError(f"{where}: 'port' must be an integer")
+    models: tuple[str, ...] = ()
+    if "models" in raw:
+        if not isinstance(raw["models"], list):
+            raise ConfigError(f"{where}: 'models' must be a list of strings")
+        seen_models: set[str] = set()
+        for i, m in enumerate(raw["models"]):
+            if not isinstance(m, str) or not m:
+                raise ConfigError(f"{where}: models[{i}] must be a non-empty string")
+            if m in seen_models:
+                raise ConfigError(f"{where}: duplicate model id {m!r} in 'models'")
+            seen_models.add(m)
+        models = tuple(raw["models"])
+    default = raw.get("default", False)
+    if not isinstance(default, bool):
+        raise ConfigError(f"{where}: 'default' must be a boolean")
+    thresholds: tuple[Threshold, ...] | None = None
+    if "thresholds" in raw:
+        thresholds = tuple(_parse_thresholds(raw["thresholds"], where))
+    target_kv_cache_pct: float | None = None
+    if "target_kv_cache_pct" in raw:
+        if not _is_number(raw["target_kv_cache_pct"]):
+            raise ConfigError(f"{where}: 'target_kv_cache_pct' must be a number")
+        target_kv_cache_pct = float(raw["target_kv_cache_pct"])
+    token_margin: float | None = None
+    if "token_margin" in raw:
+        if not _is_number(raw["token_margin"]):
+            raise ConfigError(f"{where}: 'token_margin' must be a number")
+        token_margin = float(raw["token_margin"])
+    retry_min_s: int | None = None
+    if "retry_min_s" in raw:
+        if not _is_int(raw["retry_min_s"]):
+            raise ConfigError(f"{where}: 'retry_min_s' must be an integer")
+        retry_min_s = raw["retry_min_s"]
+    retry_max_s: int | None = None
+    if "retry_max_s" in raw:
+        if not _is_int(raw["retry_max_s"]):
+            raise ConfigError(f"{where}: 'retry_max_s' must be an integer")
+        retry_max_s = raw["retry_max_s"]
+    return Backend(
+        name=name,
+        host=host,
+        port=port,
+        models=models,
+        default=default,
+        thresholds=thresholds,
+        target_kv_cache_pct=target_kv_cache_pct,
+        token_margin=token_margin,
+        retry_min_s=retry_min_s,
+        retry_max_s=retry_max_s,
+    )
+
+
+def _parse_backends(raw: Any, source: str) -> list[Backend]:
+    """Parse a ``backends`` value (list of objects) into Backends."""
+    if not isinstance(raw, list):
+        raise ConfigError(f"{source}: 'backends' must be a list of objects")
+    return [_parse_backend_entry(entry, source, i) for i, entry in enumerate(raw)]
 
 
 def _load_file(path: str) -> dict[str, Any]:
@@ -151,13 +281,15 @@ def _merge_file(data: GateConfig, raw: dict[str, Any], source: str) -> GateConfi
             if not _is_int(raw[key]):
                 raise ConfigError(f"{source}: '{key}' must be an integer")
             updates[key] = raw[key]
-    for key in ("metrics_poll_interval_s", "stale_after_s"):
+    for key in ("metrics_poll_interval_s", "stale_after_s", "model_refresh_interval_s"):
         if key in raw:
             if not _is_number(raw[key]):
                 raise ConfigError(f"{source}: '{key}' must be a number")
             updates[key] = float(raw[key])
     if "thresholds" in raw:
         updates["thresholds"] = tuple(_parse_thresholds(raw["thresholds"], source))
+    if "backends" in raw:
+        updates["backends"] = tuple(_parse_backends(raw["backends"], source))
     for key in ("retry_min_s", "retry_max_s"):
         if key in raw:
             if not _is_int(raw[key]):
@@ -215,6 +347,14 @@ def _apply_env(data: GateConfig, env: Mapping[str, str]) -> GateConfig:
         except json.JSONDecodeError as e:
             raise ConfigError(f"THRESHOLDS_JSON is not valid JSON: {e}") from e
         updates["thresholds"] = tuple(_parse_thresholds(raw, "THRESHOLDS_JSON"))
+    backends_raw = env.get("BACKENDS_JSON")
+    if backends_raw is not None:
+        try:
+            raw = json.loads(backends_raw)
+        except json.JSONDecodeError as e:
+            raise ConfigError(f"BACKENDS_JSON is not valid JSON: {e}") from e
+        # Env wins over the file entirely: this REPLACES any file backends.
+        updates["backends"] = tuple(_parse_backends(raw, "BACKENDS_JSON"))
     retry_min_s = _parse_env_int(env, "RETRY_MIN_S")
     if retry_min_s is not None:
         updates["retry_min_s"] = retry_min_s
@@ -227,6 +367,9 @@ def _apply_env(data: GateConfig, env: Mapping[str, str]) -> GateConfig:
     token_margin = _parse_env_float(env, "TOKEN_MARGIN")
     if token_margin is not None:
         updates["token_margin"] = token_margin
+    model_refresh_interval_s = _parse_env_float(env, "MODEL_REFRESH_INTERVAL_S")
+    if model_refresh_interval_s is not None:
+        updates["model_refresh_interval_s"] = model_refresh_interval_s
     return replace(data, **updates)
 
 
@@ -261,6 +404,11 @@ def _validate(data: GateConfig) -> None:
         )
     if not math.isfinite(data.stale_after_s) or data.stale_after_s <= 0:
         raise ConfigError(f"stale_after_s must be a finite number > 0, got {data.stale_after_s}")
+    if not math.isfinite(data.model_refresh_interval_s) or data.model_refresh_interval_s <= 0:
+        raise ConfigError(
+            f"model_refresh_interval_s must be a finite number > 0, "
+            f"got {data.model_refresh_interval_s}"
+        )
     if not math.isfinite(data.target_kv_cache_pct) or not 0 < data.target_kv_cache_pct <= 100:
         raise ConfigError(
             f"target_kv_cache_pct must be a finite number in (0, 100], "
@@ -275,6 +423,80 @@ def _validate(data: GateConfig) -> None:
         )
     if not math.isfinite(data.token_margin) or data.token_margin < 1.0:
         raise ConfigError(f"token_margin must be a finite number >= 1.0, got {data.token_margin}")
+    _validate_backends(data)
+
+
+def _validate_backends(data: GateConfig) -> None:
+    """Validate the optional ``backends`` list (no-op when absent).
+
+    Legacy single-backend configs (no ``backends``) are untouched. When
+    present: names are unique and non-empty, ports are in 1-65535, model ids
+    are globally unique across backends, at most one backend is
+    ``default: true``, and each per-backend knob, when present, satisfies the
+    same ranges as the global default.
+    """
+    if not data.backends:
+        return
+    seen_names: set[str] = set()
+    seen_models: dict[str, str] = {}  # model id -> backend name
+    defaults = 0
+    for i, b in enumerate(data.backends):
+        where = f"backends[{i}] ({b.name})"
+        if not b.name:
+            raise ConfigError(f"{where}: backend name must be a non-empty string")
+        if b.name in seen_names:
+            raise ConfigError(f"{where}: duplicate backend name {b.name!r}")
+        seen_names.add(b.name)
+        if not 1 <= b.port <= 65535:
+            raise ConfigError(f"{where}: port must be in [1, 65535], got {b.port}")
+        for m in b.models:
+            if m in seen_models:
+                raise ConfigError(
+                    f"{where}: model id {m!r} is already owned by backend "
+                    f"{seen_models[m]!r}; model ids must be unique across backends"
+                )
+            seen_models[m] = b.name
+        if b.default:
+            defaults += 1
+        if b.thresholds is not None:
+            seen_kv: set[float] = set()
+            for j, t in enumerate(b.thresholds):
+                twhere = f"{where}: thresholds[{j}]"
+                if not 0 <= t.kv_pct <= 100:
+                    raise ConfigError(f"{twhere}: kv_pct must be in [0, 100], got {t.kv_pct}")
+                if t.max_context < 1:
+                    raise ConfigError(f"{twhere}: max_context must be >= 1, got {t.max_context}")
+                if t.timeout_s < 1:
+                    raise ConfigError(f"{twhere}: timeout_s must be >= 1, got {t.timeout_s}")
+                if t.kv_pct in seen_kv:
+                    raise ConfigError(f"{twhere}: duplicate kv_pct {t.kv_pct}")
+                seen_kv.add(t.kv_pct)
+        if b.target_kv_cache_pct is not None and (
+            not math.isfinite(b.target_kv_cache_pct) or not 0 < b.target_kv_cache_pct <= 100
+        ):
+            raise ConfigError(
+                f"{where}: target_kv_cache_pct must be a finite number in (0, 100], "
+                f"got {b.target_kv_cache_pct}"
+            )
+        if b.token_margin is not None and (
+            not math.isfinite(b.token_margin) or b.token_margin < 1.0
+        ):
+            raise ConfigError(
+                f"{where}: token_margin must be a finite number >= 1.0, got {b.token_margin}"
+            )
+        if b.retry_min_s is not None and (not _is_int(b.retry_min_s) or b.retry_min_s < 1):
+            raise ConfigError(f"{where}: retry_min_s must be an integer >= 1, got {b.retry_min_s}")
+        # The effective pair (per-backend override falling back to the global
+        # default) must satisfy the same max >= min rule as the globals.
+        effective_min = b.retry_min_s if b.retry_min_s is not None else data.retry_min_s
+        effective_max = b.retry_max_s if b.retry_max_s is not None else data.retry_max_s
+        if not _is_int(effective_max) or effective_max < effective_min:
+            raise ConfigError(
+                f"{where}: retry_max_s must be an integer >= retry_min_s "
+                f"({effective_min}), got {effective_max}"
+            )
+    if defaults > 1:
+        raise ConfigError(f"at most one backend may have 'default: true', got {defaults}")
 
 
 def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -> GateConfig:
@@ -285,6 +507,8 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     - ``path``: explicit config file; must exist and be valid YAML.
     - ``path is None``: use ``DEFAULT_CONFIG_PATH`` if it exists, else defaults.
     - ``env``: overrides applied last; defaults to ``os.environ``.
+      ``BACKENDS_JSON`` (a JSON list of backend objects) REPLACES the file's
+      ``backends:`` entirely, mirroring ``THRESHOLDS_JSON``.
 
     Raises :class:`ConfigError` on any invalid input or validation failure.
     """
