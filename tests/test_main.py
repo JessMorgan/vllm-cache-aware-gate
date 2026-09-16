@@ -5,8 +5,10 @@ the happy path builds the app via ``create_app`` with ``start_poller=True``
 and hands it to ``uvicorn.run`` with the configured listen host/port, the
 ``LOG_LEVEL`` env var is forwarded to uvicorn, and the startup INFO log
 reports one line per backend (name, host:port, default flag, tier count,
-and the four autoconfig knobs with per-backend overrides marked). Uvicorn
-itself is recorded, not run.
+and the four autoconfig knobs with per-backend overrides marked) plus one
+line per ``routing:`` entry (model → policy/order, threshold for
+``large_small``) — with no routing lines for an empty ``routing:`` section.
+Uvicorn itself is recorded, not run.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ from dataclasses import replace
 import pytest
 
 import gate.main as main_mod
-from gate.config import Backend, ConfigError, GateConfig, Threshold
+from gate.config import Backend, ConfigError, GateConfig, RoutingEntry, Threshold
+from gate.routing import RoutingSpec
 
 
 def make_cfg() -> GateConfig:
@@ -203,3 +206,53 @@ def test_startup_logs_tier_count_and_overrides(
         "backend 'vllm' (vllm:9000) [default]: 2 tier(s), target 80.0% (override), "
         "margin 1.2 (override), retry 5-60s" in messages
     )
+
+
+def test_startup_logs_routing_entries(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-empty routing section logs one INFO line per entry: model,
+    policy, and order — plus the threshold for the large_small entry."""
+    cfg = make_cfg()
+    cfg = replace(
+        cfg,
+        routing=(
+            RoutingEntry(
+                model="small",
+                spec=RoutingSpec(policy="fill", order=("a", "b")),
+            ),
+            RoutingEntry(
+                model="big",
+                spec=RoutingSpec(
+                    policy="large_small", order=("big", "small"), threshold_tokens=8000
+                ),
+            ),
+        ),
+    )
+    _stub_uvicorn_and_deps(monkeypatch, cfg)
+
+    with caplog.at_level(logging.INFO, logger="gate.main"):
+        main_mod.main()
+
+    messages = [r.message for r in caplog.records if r.name == "gate.main"]
+    assert "routing 'small': policy=fill order=['a', 'b']" in messages
+    assert (
+        "routing 'big': policy=large_small order=['big', 'small'], threshold 8000 tokens"
+        in messages
+    )
+    assert all(r.levelno == logging.INFO for r in caplog.records if r.name == "gate.main")
+
+
+def test_startup_logs_nothing_for_empty_routing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An empty routing section emits no routing INFO lines."""
+    cfg = make_cfg()  # routing defaults to ()
+    assert cfg.routing == ()
+    _stub_uvicorn_and_deps(monkeypatch, cfg)
+
+    with caplog.at_level(logging.INFO, logger="gate.main"):
+        main_mod.main()
+
+    messages = [r.message for r in caplog.records if r.name == "gate.main"]
+    assert not any(m.startswith("routing ") for m in messages)

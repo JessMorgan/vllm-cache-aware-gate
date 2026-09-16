@@ -9,8 +9,10 @@ configured backend — name, host:port, the default flag, the tiered tier
 count (or "none — autoconfig only"), and the four autoconfig knobs with
 "(override)" marking the per-backend values that are explicitly set (an
 unmarked value is the global default) — so the operator can confirm the
-active per-backend policy. There is no CLI: argv is ignored (autoconfig is
-always on).
+active per-backend policy. It then logs one INFO line per ``routing:``
+entry (model → policy/order, plus the ``large_small`` threshold when
+present); an empty ``routing:`` section logs nothing. There is no CLI:
+argv is ignored (autoconfig is always on).
 """
 
 from __future__ import annotations
@@ -80,6 +82,24 @@ def main() -> None:
             margin,
             retry_min,
             retry_max,
+        )
+
+    # One INFO line per routing entry (decision 9/15): model, policy, and
+    # candidate order — plus the threshold for large_small — so the operator
+    # can confirm the active per-model routing. An empty routing section
+    # logs nothing (no noise).
+    for entry in cfg.routing:
+        threshold = (
+            f", threshold {entry.spec.threshold_tokens} tokens"
+            if entry.spec.threshold_tokens is not None
+            else ""
+        )
+        log.info(
+            "routing %r: policy=%s order=%s%s",
+            entry.model,
+            entry.spec.policy,
+            list(entry.spec.order),
+            threshold,
         )
 
     client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
