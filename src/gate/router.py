@@ -280,7 +280,9 @@ def decision_auto(
 
     1. ``remaining_tokens is None`` -> allow, ``reason="auto_unanchored"``
        (defensive: a fresh usage without an anchor is only a cold-start
-       sliver; an observed body with usage but no capacity is fatal upstream).
+       sliver; an observed body with usage but no capacity leaves the counter
+       unanchored — the poller unanchors it — so the autoconfig layer fails
+       open).
     2. ``ctx_tokens is None`` -> allow, ``reason="prompt_unparseable"``
        (fail open: an estimation failure must not reject).
     3. ``effective = ceil(ctx_tokens * token_margin)``:

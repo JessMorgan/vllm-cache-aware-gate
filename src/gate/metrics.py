@@ -313,6 +313,16 @@ class KvRemaining:
         """Reset the estimate to ``tokens`` (poller, each good poll)."""
         self._value = tokens
 
+    def unanchor(self) -> None:
+        """Reset to the never-anchored state (poller, on a capacity-missing observed body).
+
+        The autoconfig layer fails open while the counter is unanchored
+        (``decision_auto`` allows with reason ``auto_unanchored``), so a stale
+        anchor from an earlier good poll can never drive a real (fail-closed)
+        decision off stale data.
+        """
+        self._value = None
+
     def subtract(self, tokens: int) -> None:
         """Charge ``tokens`` to the estimate (app, on every forwarded request).
 
