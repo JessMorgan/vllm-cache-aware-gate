@@ -8,7 +8,8 @@ import pytest
 import yaml
 
 from gate import config
-from gate.config import Backend, ConfigError, GateConfig, Threshold, load_config
+from gate.config import Backend, ConfigError, GateConfig, RoutingEntry, Threshold, load_config
+from gate.routing import RoutingSpec
 
 
 def _write(tmp_path, data: object, name: str = "config.yaml") -> str:
@@ -976,15 +977,19 @@ def test_backends_duplicate_name_raises():
         load_config(path=None, env=env)
 
 
-def test_backends_model_id_duplicated_across_backends_raises():
+def test_backends_model_id_duplicated_across_backends_is_legal():
+    """Duplicate model ids across backends are LEGAL (decision 11 supersedes
+    the old global-uniqueness rule): the routing: section decides which
+    backend gets a request, so the config must load."""
     env = _backend_env(
         [
             {"name": "a", "host": "h1", "port": 1, "models": ["shared"]},
             {"name": "b", "host": "h2", "port": 2, "models": ["shared"]},
         ]
     )
-    with pytest.raises(ConfigError, match="unique across backends"):
-        load_config(path=None, env=env)
+    cfg = load_config(path=None, env=env)
+    assert cfg.backends[0].models == ("shared",)
+    assert cfg.backends[1].models == ("shared",)
 
 
 def test_backends_model_id_duplicated_within_backend_raises():
@@ -1184,3 +1189,210 @@ def test_backends_port_bool_raises():
     env = _backend_env([{"name": "b1", "host": "h1", "port": True}])
     with pytest.raises(ConfigError, match="'port'"):
         load_config(path=None, env=env)
+
+
+# --- routing (multi-backend, decision 9/15) -----------------------------------
+
+
+def _routing_file(tmp_path, routing: object) -> str:
+    """A config file with two backends plus the given routing section
+    (routing is file-only — there is no env override)."""
+    return _write(
+        tmp_path,
+        {
+            "backends": [
+                {"name": "a", "host": "h1", "port": 1},
+                {"name": "b", "host": "h2", "port": 2},
+            ],
+            "routing": routing,
+        },
+    )
+
+
+def test_routing_valid_two_entries(tmp_path):
+    """A valid routing mapping parses to RoutingEntry/RoutingSpec exactly."""
+    path = _routing_file(
+        tmp_path,
+        {
+            "m1": {"policy": "fill", "order": ["a", "b"]},
+            "m2": {"policy": "large_small", "order": ["b", "a"], "threshold_tokens": 4096},
+        },
+    )
+    cfg = load_config(path=path, env={})
+    assert cfg.routing == (
+        RoutingEntry(model="m1", spec=RoutingSpec(policy="fill", order=("a", "b"))),
+        RoutingEntry(
+            model="m2",
+            spec=RoutingSpec(policy="large_small", order=("b", "a"), threshold_tokens=4096),
+        ),
+    )
+
+
+def test_routing_omitted_is_empty_tuple(tmp_path):
+    path = _write(tmp_path, {"backends": [{"name": "b1", "host": "h1", "port": 8000}]})
+    cfg = load_config(path=path, env={})
+    assert cfg.routing == ()
+
+
+def test_routing_empty_mapping_is_empty_tuple(tmp_path):
+    path = _routing_file(tmp_path, {})
+    cfg = load_config(path=path, env={})
+    assert cfg.routing == ()
+
+
+def test_routing_not_a_mapping_raises(tmp_path):
+    path = _routing_file(tmp_path, [{"policy": "fill", "order": ["a"]}])
+    with pytest.raises(ConfigError, match="must be a mapping of model id to entry"):
+        load_config(path=path, env={})
+
+
+def test_routing_non_string_model_key_raises(tmp_path):
+    path = _routing_file(tmp_path, {123: {"policy": "fill", "order": ["a"]}})
+    with pytest.raises(ConfigError, match="model id must be a non-empty string"):
+        load_config(path=path, env={})
+
+
+def test_routing_empty_model_key_raises(tmp_path):
+    path = _routing_file(tmp_path, {"": {"policy": "fill", "order": ["a"]}})
+    with pytest.raises(ConfigError, match="model id must be a non-empty string"):
+        load_config(path=path, env={})
+
+
+def test_routing_entry_not_a_dict_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": "fill"})
+    with pytest.raises(ConfigError, match="entry must be an object"):
+        load_config(path=path, env={})
+
+
+def test_routing_unknown_key_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": ["a"], "bogus": 1}})
+    with pytest.raises(ConfigError, match="unknown routing key"):
+        load_config(path=path, env={})
+
+
+def test_routing_missing_policy_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"order": ["a"]}})
+    with pytest.raises(ConfigError, match="'policy'"):
+        load_config(path=path, env={})
+
+
+def test_routing_non_string_policy_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": 7, "order": ["a"]}})
+    with pytest.raises(ConfigError, match="'policy'"):
+        load_config(path=path, env={})
+
+
+def test_routing_unknown_policy_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "greedy", "order": ["a"]}})
+    with pytest.raises(ConfigError, match="unknown routing policy"):
+        load_config(path=path, env={})
+
+
+def test_routing_missing_order_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill"}})
+    with pytest.raises(ConfigError, match="'order'"):
+        load_config(path=path, env={})
+
+
+def test_routing_empty_order_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": []}})
+    with pytest.raises(ConfigError, match="'order'"):
+        load_config(path=path, env={})
+
+
+def test_routing_order_not_a_list_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": "a"}})
+    with pytest.raises(ConfigError, match="'order'"):
+        load_config(path=path, env={})
+
+
+def test_routing_order_non_string_entry_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": [7]}})
+    with pytest.raises(ConfigError, match="order\\[0\\]"):
+        load_config(path=path, env={})
+
+
+def test_routing_order_empty_string_entry_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": [""]}})
+    with pytest.raises(ConfigError, match="order\\[0\\]"):
+        load_config(path=path, env={})
+
+
+def test_routing_order_duplicate_entry_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": ["a", "a"]}})
+    with pytest.raises(ConfigError, match="duplicate backend name"):
+        load_config(path=path, env={})
+
+
+@pytest.mark.parametrize("policy", ["round_robin", "primary_fallback", "even", "fill"])
+def test_routing_threshold_tokens_on_non_large_small_raises(tmp_path, policy):
+    path = _routing_file(
+        tmp_path, {"m1": {"policy": policy, "order": ["a", "b"], "threshold_tokens": 100}}
+    )
+    with pytest.raises(ConfigError, match="threshold_tokens"):
+        load_config(path=path, env={})
+
+
+def test_routing_threshold_tokens_absent_on_large_small_raises(tmp_path):
+    path = _routing_file(tmp_path, {"m1": {"policy": "large_small", "order": ["a", "b"]}})
+    with pytest.raises(ConfigError, match="threshold_tokens"):
+        load_config(path=path, env={})
+
+
+def test_routing_threshold_tokens_zero_raises(tmp_path):
+    path = _routing_file(
+        tmp_path, {"m1": {"policy": "large_small", "order": ["a", "b"], "threshold_tokens": 0}}
+    )
+    with pytest.raises(ConfigError, match="threshold_tokens"):
+        load_config(path=path, env={})
+
+
+def test_routing_threshold_tokens_negative_raises(tmp_path):
+    path = _routing_file(
+        tmp_path, {"m1": {"policy": "large_small", "order": ["a", "b"], "threshold_tokens": -5}}
+    )
+    with pytest.raises(ConfigError, match="threshold_tokens"):
+        load_config(path=path, env={})
+
+
+def test_routing_threshold_tokens_bool_raises(tmp_path):
+    path = _routing_file(
+        tmp_path, {"m1": {"policy": "large_small", "order": ["a", "b"], "threshold_tokens": True}}
+    )
+    with pytest.raises(ConfigError, match="threshold_tokens"):
+        load_config(path=path, env={})
+
+
+def test_routing_threshold_tokens_float_raises(tmp_path):
+    path = _routing_file(
+        tmp_path, {"m1": {"policy": "large_small", "order": ["a", "b"], "threshold_tokens": 1.5}}
+    )
+    with pytest.raises(ConfigError, match="threshold_tokens"):
+        load_config(path=path, env={})
+
+
+def test_routing_order_unknown_backend_raises(tmp_path):
+    """Every order name must be a configured backend (decision 15)."""
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": ["a", "ghost"]}})
+    with pytest.raises(ConfigError, match="unknown backend 'ghost'"):
+        load_config(path=path, env={})
+
+
+def test_routing_order_single_backend_is_valid(tmp_path):
+    """A one-candidate order is legal (e.g. an explicit pin)."""
+    path = _routing_file(tmp_path, {"m1": {"policy": "primary_fallback", "order": ["a"]}})
+    cfg = load_config(path=path, env={})
+    assert cfg.routing == (
+        RoutingEntry(model="m1", spec=RoutingSpec(policy="primary_fallback", order=("a",))),
+    )
+
+
+def test_routing_is_file_only_no_env_override(tmp_path):
+    """There is no routing env var: no code reads one, so an env var named
+    like one (e.g. ROUTING_JSON) is simply never consulted — the file's
+    routing section is unaffected by it."""
+    path = _routing_file(tmp_path, {"m1": {"policy": "fill", "order": ["a"]}})
+    cfg = load_config(
+        path=path, env={"ROUTING_JSON": json.dumps({"m9": {"policy": "fill", "order": ["a"]}})}
+    )
+    assert cfg.routing == (RoutingEntry(model="m1", spec=RoutingSpec(policy="fill", order=("a",))),)
