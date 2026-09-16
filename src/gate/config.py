@@ -57,6 +57,7 @@ _KNOWN_KEYS: frozenset[str] = frozenset(
         "backends",
         "model_refresh_interval_s",
         "routing",
+        "log_level",
     }
 )
 
@@ -153,6 +154,7 @@ class GateConfig:
     model_refresh_interval_s: float = 30.0
     chars_per_token: int = 4
     default_max_tokens: int = 256
+    log_level: str = "INFO"
     thresholds: tuple[Threshold, ...] = ()
     target_kv_cache_pct: float = 85.0
     retry_min_s: int = 5
@@ -430,7 +432,29 @@ def _merge_file(data: GateConfig, raw: dict[str, Any], source: str) -> GateConfi
             if not _is_number(raw[key]):
                 raise ConfigError(f"{source}: '{key}' must be a number")
             updates[key] = float(raw[key])
+    if "log_level" in raw:
+        updates["log_level"] = _parse_log_level(raw["log_level"], source)
     return replace(data, **updates)
+
+
+_LOG_LEVELS: frozenset[str] = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+def _parse_log_level(raw: Any, source: str) -> str:
+    """Parse a ``log_level`` value into an uppercase log-level name.
+
+    Accepts any case (e.g. ``debug``); raises :class:`ConfigError` naming the
+    valid set for anything else.
+    """
+    if not isinstance(raw, str):
+        raise ConfigError(f"{source}: 'log_level' must be a string")
+    level = raw.upper()
+    if level not in _LOG_LEVELS:
+        raise ConfigError(
+            f"{source}: 'log_level' must be one of "
+            f"{sorted(_LOG_LEVELS)} (case-insensitive), got {raw!r}"
+        )
+    return level
 
 
 def _parse_env_int(env: Mapping[str, str], name: str) -> int | None:
@@ -498,6 +522,8 @@ def _apply_env(data: GateConfig, env: Mapping[str, str]) -> GateConfig:
     model_refresh_interval_s = _parse_env_float(env, "MODEL_REFRESH_INTERVAL_S")
     if model_refresh_interval_s is not None:
         updates["model_refresh_interval_s"] = model_refresh_interval_s
+    if "LOG_LEVEL" in env:
+        updates["log_level"] = _parse_log_level(env["LOG_LEVEL"], "LOG_LEVEL")
     return replace(data, **updates)
 
 

@@ -491,7 +491,7 @@ env-var overrides for the essentials. A reference file is provided at
 ```yaml
 # env overrides: BACKENDS_JSON, LISTEN_HOST, LISTEN_PORT, THRESHOLDS_JSON,
 # TARGET_KV_CACHE_PCT, RETRY_MIN_S, RETRY_MAX_S, TOKEN_MARGIN,
-# MODEL_REFRESH_INTERVAL_S
+# MODEL_REFRESH_INTERVAL_S, LOG_LEVEL
 
 # REQUIRED — at least one backend (name + host + port). The legacy
 # vllm_host/vllm_port keys and VLLM_HOST/VLLM_PORT env vars are REMOVED.
@@ -541,6 +541,7 @@ backends:
 
 listen_host: 0.0.0.0
 listen_port: 8000
+log_level: INFO             # debug | info | warning | error | critical (env: LOG_LEVEL)
 metrics_poll_interval_s: 2.0
 stale_after_s: 6.0
 model_refresh_interval_s: 30.0  # per-backend /v1/models discovery cadence
@@ -574,6 +575,7 @@ token_margin: 1.25
 | `routing` | mapping | *(absent)* | — | **Optional, file-only** (no env override) per-model routing for model ids served by 2+ backends: `model → {policy, order[, threshold_tokens]}`. Omitted or `{}` is valid; every malformed entry is a `ConfigError`. A multi-owner model with no entry defaults to `round_robin` over its candidates in config order. See [Routing policies](#routing-policies-per-model) and the [`routing` entry contract](#routing-entry-contract-optional). |
 | `listen_host` | string | `0.0.0.0` | `LISTEN_HOST` | Bind address for the gate. |
 | `listen_port` | int | `8000` | `LISTEN_PORT` | Port the gate listens on. |
+| `log_level` | string | `INFO` | `LOG_LEVEL` | Logging level for the gate's own loggers **and** uvicorn: one of `debug`, `info`, `warning`, `error`, `critical` (case-insensitive; default `INFO`). Anything else is a `ConfigError`. |
 | `metrics_poll_interval_s` | float | `2.0` | — | How often **each backend's** `/metrics` is polled (one poller per backend, one GET per tick). |
 | `stale_after_s` | float | `6.0` | — | Age after which a backend's cached value is treated as unknown (fail-open for that backend). |
 | `model_refresh_interval_s` | float | `30.0` | `MODEL_REFRESH_INTERVAL_S` | How often **each backend's** `GET /v1/models` is re-fetched (model discovery; the first fetch is immediate). |
@@ -900,7 +902,11 @@ scrape_configs:
 - **No auth, no TLS termination (v1).** The gate trusts the deployment network
   and is a drop-in front of vLLM. Put it behind your existing ingress/auth if
   you need it.
-- **Logging.** Structured `logging` at INFO: one line per reject decision
+- **Logging.** Level is configurable via the `log_level` config key /
+  `LOG_LEVEL` env var (one of `debug`, `info`, `warning`, `error`,
+  `critical`, case-insensitive; default `INFO`), applied to the gate's own
+  loggers and uvicorn. Structured `logging` at the configured level: one line
+  per reject decision
   (`reject backend=… reason=… usage_pct=… ctx_tokens=… retry_after=…` — the
   backend is the routed candidate), one line per pre-stream failover skip
   (`routing_failover model=… from=… to=… reason=…`, `reason` ∈ `transport` /

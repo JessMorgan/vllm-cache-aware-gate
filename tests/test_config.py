@@ -386,6 +386,92 @@ def test_zero_stale_after_raises(tmp_path):
         load_config(path=path, env={})
 
 
+def test_log_level_default_is_info(tmp_path):
+    """An absent log_level falls back to the INFO default."""
+    path = _write(tmp_path, {"backends": [{"name": "b1", "host": "h1", "port": 8000}]})
+    cfg = load_config(path=path, env={})
+    assert cfg.log_level == "INFO"
+
+
+def test_log_level_from_file_is_uppercased(tmp_path):
+    """A lowercase file log_level loads as its uppercase name."""
+    path = _write(
+        tmp_path,
+        {
+            "log_level": "debug",
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+        },
+    )
+    cfg = load_config(path=path, env={})
+    assert cfg.log_level == "DEBUG"
+
+
+def test_log_level_env_wins_over_file(tmp_path):
+    """The LOG_LEVEL env var overrides the file's log_level."""
+    path = _write(
+        tmp_path,
+        {
+            "log_level": "debug",
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+        },
+    )
+    cfg = load_config(path=path, env={"LOG_LEVEL": "WARNING"})
+    assert cfg.log_level == "WARNING"
+
+
+def test_bad_log_level_file_raises(tmp_path):
+    """An unrecognized file log_level is a ConfigError naming the valid set."""
+    path = _write(
+        tmp_path,
+        {
+            "log_level": "chatty",
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+        },
+    )
+    with pytest.raises(ConfigError, match="log_level"):
+        load_config(path=path, env={})
+
+
+def test_bad_log_level_env_raises():
+    """An unrecognized LOG_LEVEL env var is a ConfigError."""
+    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        load_config(
+            path=None,
+            env={
+                "LOG_LEVEL": "chatty",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
+
+
+@pytest.mark.parametrize("bad", [5, 5.5, True, None])
+def test_non_string_log_level_file_raises(tmp_path, bad: object):
+    """A non-string file log_level (int, float, bool, null) is a ConfigError."""
+    path = _write(
+        tmp_path,
+        {
+            "log_level": bad,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+        },
+    )
+    with pytest.raises(ConfigError, match="log_level"):
+        load_config(path=path, env={})
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "  info  "])
+def test_blank_log_level_env_raises(bad: str):
+    """An empty or whitespace-only LOG_LEVEL env var is a ConfigError
+    (whitespace is not trimmed, so '  info  ' is not a valid level)."""
+    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        load_config(
+            path=None,
+            env={
+                "LOG_LEVEL": bad,
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
+
+
 # --- boundary conditions ---------------------------------------------------------
 
 

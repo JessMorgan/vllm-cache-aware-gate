@@ -82,7 +82,10 @@ FastAPI app wires together.
   `TARGET_KV_CACHE_PCT`), `retry_min_s` (`5`, `RETRY_MIN_S`), `retry_max_s`
   (`60`, `RETRY_MAX_S`), `token_margin` (`1.25`, `TOKEN_MARGIN`), plus
   `model_refresh_interval_s` (`30.0`, `MODEL_REFRESH_INTERVAL_S`) — the
-  per-backend `/v1/models` discovery cadence.
+  per-backend `/v1/models` discovery cadence — and `log_level` (`INFO`,
+  `LOG_LEVEL`), the logging level (case-insensitive, must be one of
+  `debug`/`info`/`warning`/`error`/`critical`; anything else is a
+  `ConfigError`) applied at startup to the gate's loggers and uvicorn.
 - **`src/gate/tokens.py`** — `estimate_context_tokens(body, cfg) -> int |
   None`. Pure. Estimates prompt tokens as `ceil(prompt_chars / chars_per_token)`
   plus `max_tokens` headroom (default 256); returns `None` on an
@@ -281,14 +284,18 @@ FastAPI app wires together.
   `kv_usage`, `kv_cache_capacity_tokens`, `kv_cache_remaining_tokens`) plus the
   known models (each with `owned_by` — scalar or list — and `routing`, the
   policy in effect: the `routing:` entry's policy or `round_robin`).
-- **`src/gate/main.py`** — `main()` entrypoint: load config, log **one INFO
-  line per backend** (name, host:port, `[default]`, effective tier count —
-  `N tier(s)` or `none — autoconfig only` — and the four autoconfig knobs with
-  `(override)` marking the per-backend values), then **one INFO line per
-  `routing:` entry** (model → policy + order, plus `threshold_tokens` for
-  `large_small`; an empty `routing:` section logs nothing), build the app (the
-  pollers are started by the app lifespan, not here), and run uvicorn. There is
-  **no CLI** — argv is ignored (autoconfig is always on).
+- **`src/gate/main.py`** — `main()` entrypoint: `logging.basicConfig` at the
+  `INFO` default (so a `ConfigError` still logs before the config exists),
+  load config, then apply the config's `log_level` to the root logger
+  (`logging.root.setLevel`), log **one INFO line per backend** (name,
+  host:port, `[default]`, effective tier count — `N tier(s)` or
+  `none — autoconfig only` — and the four autoconfig knobs with `(override)`
+  marking the per-backend values), then **one INFO line per `routing:`
+  entry** (model → policy + order, plus `threshold_tokens` for `large_small`;
+  an empty `routing:` section logs nothing), build the app (the pollers are
+  started by the app lifespan, not here), and run uvicorn (the config's
+  `log_level`, lowercased, is passed as `log_level=`). There is **no CLI** —
+  argv is ignored (autoconfig is always on).
 - **`tests/`** — `test_tokens.py`, `test_router.py`, `test_metrics.py`,
   `test_models.py` (parse + registry, incl. `resolve_candidates`: single-owner
   1-tuple, multi-owner ordered tuple, removal), `test_routing.py` (pure
@@ -297,8 +304,10 @@ FastAPI app wires together.
   incl. unknowns-last and ties, `fill` first-fit / all-full → `None` /
   unknowns eligible, spec/order edge cases), `test_config.py` (backends +
   `BACKENDS_JSON` + validation + `routing:` parsing/validation — bad policy,
-  empty order, unknown backend in order, `threshold_tokens` iff `large_small`;
-  duplicate model ids across backends **now legal**), `test_stats.py`,
+  empty order, unknown backend in order, `threshold_tokens` iff
+  `large_small`; `log_level` file/env parse + validation; duplicate model
+  ids across backends **now legal**),
+  `test_stats.py`,
   `test_api.py` (ASGI end-to-end with fake vLLMs — multi-backend routing,
   per-policy routing, pre-stream failover + charge rollback, exhaustion
   429-max / 502 / last-5xx-propagated, `/v1/models` duplicate `owned_by`,

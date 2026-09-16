@@ -91,6 +91,11 @@ routing:
 listen_host: 0.0.0.0
 listen_port: 8000
 
+# Logging level for the gate's own loggers and uvicorn: one of debug, info,
+# warning, error, critical (case-insensitive; default: INFO).
+# (env override: LOG_LEVEL)
+log_level: INFO
+
 # How often each backend's /metrics is polled (one poller per backend, one
 # GET per tick).
 metrics_poll_interval_s: 2.0

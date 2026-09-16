@@ -3,7 +3,9 @@
 Covers the wiring contract of ``main()``: a ``ConfigError`` exits non-zero,
 the happy path builds the app via ``create_app`` with ``start_poller=True``
 and hands it to ``uvicorn.run`` with the configured listen host/port, the
-``LOG_LEVEL`` env var is forwarded to uvicorn, and the startup INFO log
+config's ``log_level`` (file key; ``LOG_LEVEL`` env override, default
+``INFO``) is applied to the root logger and forwarded lowercased to
+``uvicorn.run``, and the startup INFO log
 reports one line per backend (name, host:port, default flag, tier count,
 and the four autoconfig knobs with per-backend overrides marked) plus one
 line per ``routing:`` entry (model → policy/order, threshold for
@@ -95,9 +97,10 @@ def test_happy_path_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     assert call["port"] == cfg.listen_port
 
 
-def test_log_level_env_forwarded_to_uvicorn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """LOG_LEVEL=DEBUG is lowercased and passed to uvicorn.run."""
+def test_log_level_forwarded_to_uvicorn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config log_level of DEBUG is lowercased and passed to uvicorn.run."""
     cfg = make_cfg()
+    cfg = replace(cfg, log_level="DEBUG")
     monkeypatch.setattr(main_mod, "load_config", lambda: cfg)
     monkeypatch.setattr(main_mod, "create_app", lambda _cfg, **_kw: object())
     monkeypatch.setattr(main_mod.httpx, "AsyncClient", lambda **_kw: object())
@@ -108,7 +111,6 @@ def test_log_level_env_forwarded_to_uvicorn(monkeypatch: pytest.MonkeyPatch) -> 
         run_calls.append(kwargs)
 
     monkeypatch.setattr(main_mod.uvicorn, "run", fake_run)
-    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
     main_mod.main()
 
@@ -116,7 +118,7 @@ def test_log_level_env_forwarded_to_uvicorn(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_log_level_defaults_to_info(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With LOG_LEVEL unset, uvicorn.run gets log_level='info'."""
+    """With the default config log_level (INFO), uvicorn.run gets 'info'."""
     cfg = make_cfg()
     monkeypatch.setattr(main_mod, "load_config", lambda: cfg)
     monkeypatch.setattr(main_mod, "create_app", lambda _cfg, **_kw: object())
