@@ -2,6 +2,11 @@
 #
 # Reference stack: the gate in front of a vLLM instance.
 #
+# The gate needs no flags or CLI — autoconfig is always on. It runs with only
+# VLLM_HOST/VLLM_PORT (zero-config). THRESHOLDS_JSON below is OPTIONAL: it adds
+# the tiered policy on top of the always-on autoconfig layer; remove it (and
+# any config volume) for a pure zero-config run.
+#
 # The `vllm` service below is a PLACEHOLDER. It needs a GPU (vLLM does not
 # run usefully on CPU), so:
 #   - For local GPU development: uncomment the `command:` line and set the
@@ -19,6 +24,8 @@ services:
     environment:
       VLLM_HOST: vllm
       VLLM_PORT: "8000"
+      # Optional tiered policy (autoconfig is always on regardless). Omit for
+      # a zero-config run.
       THRESHOLDS_JSON: '[{"kv_pct":50,"max_context":4096,"timeout_s":15},{"kv_pct":80,"max_context":1024,"timeout_s":30}]'
       LOG_LEVEL: INFO
     # Alternative to THRESHOLDS_JSON: mount a YAML config file instead.

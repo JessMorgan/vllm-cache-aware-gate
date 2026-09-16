@@ -146,6 +146,35 @@ class TestFreshness:
         assert "gate_metrics_age_s NaN" in text
 
 
+class TestRemaining:
+    def test_sets_value(self) -> None:
+        stats = make_stats()
+        stats.set_remaining(123)
+        text = stats.render().decode()
+        assert "gate_kv_cache_remaining_tokens 123.0" in text
+
+    def test_sets_negative_value(self) -> None:
+        # An over-committed counter renders its negative value.
+        stats = make_stats()
+        stats.set_remaining(-5)
+        text = stats.render().decode()
+        assert "gate_kv_cache_remaining_tokens -5.0" in text
+
+    def test_none_renders_nan(self) -> None:
+        # None (never anchored) must render as NaN, not 0.0.
+        stats = make_stats()
+        stats.set_remaining(123)
+        stats.set_remaining(None)
+        text = stats.render().decode()
+        assert "gate_kv_cache_remaining_tokens NaN" in text
+
+    def test_initial_state_before_set_remaining(self) -> None:
+        # Before any set_remaining, the gauge must be NaN (not 0.0).
+        stats = make_stats()
+        text = stats.render().decode()
+        assert "gate_kv_cache_remaining_tokens NaN" in text
+
+
 class TestConfigInfo:
     def test_labels_present(self) -> None:
         stats = make_stats()

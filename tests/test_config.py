@@ -63,11 +63,27 @@ def test_env_overrides_win_over_file(tmp_config_file):
     assert cfg.thresholds == (Threshold(kv_pct=90.0, max_context=512, timeout_s=5),)
 
 
-def test_no_file_no_env_defaults_are_invalid(tmp_path, monkeypatch):
-    """Defaults have zero thresholds, which is invalid: must raise ConfigError."""
+def test_zero_config_no_file_no_env_is_valid(tmp_path, monkeypatch):
+    """No file and no env: zero-config is valid with defaults and no thresholds."""
     monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.yaml"))
-    with pytest.raises(ConfigError, match="at least one threshold"):
-        load_config(path=None, env={})
+    cfg = load_config(path=None, env={})
+    assert cfg.thresholds == ()
+    assert cfg.target_kv_cache_pct == 85.0
+    assert cfg.retry_min_s == 5
+    assert cfg.retry_max_s == 60
+    assert cfg.token_margin == 1.25
+
+
+def test_no_thresholds_file_is_valid(tmp_path):
+    """A file without a thresholds key loads fine (thresholds are optional)."""
+    path = _write(tmp_path, {"vllm_host": "my-vllm"})
+    cfg = load_config(path=path, env={})
+    assert cfg.vllm_host == "my-vllm"
+    assert cfg.thresholds == ()
+    assert cfg.target_kv_cache_pct == 85.0
+    assert cfg.retry_min_s == 5
+    assert cfg.retry_max_s == 60
+    assert cfg.token_margin == 1.25
 
 
 def test_default_config_path_used_when_present(tmp_path, monkeypatch):
@@ -210,9 +226,10 @@ def test_bad_thresholds_json_invalid_json_raises():
         load_config(path=None, env={"THRESHOLDS_JSON": "{oops"})
 
 
-def test_empty_thresholds_list_invalid():
-    with pytest.raises(ConfigError, match="at least one threshold"):
-        load_config(path=None, env={"THRESHOLDS_JSON": "[]"})
+def test_empty_thresholds_list_is_valid():
+    """An empty thresholds list is valid: the tiered layer simply always allows."""
+    cfg = load_config(path=None, env={"THRESHOLDS_JSON": "[]"})
+    assert cfg.thresholds == ()
 
 
 # --- scalar validation ----------------------------------------------------------
@@ -352,3 +369,174 @@ def test_wrong_type_values_raise(tmp_path):
     )
     with pytest.raises(ConfigError, match="vllm_port"):
         load_config(path=path, env={})
+
+
+# --- autoconfig knobs ---------------------------------------------------------
+
+
+def test_knob_defaults():
+    cfg = load_config(path=None, env={})
+    assert cfg.target_kv_cache_pct == 85.0
+    assert cfg.retry_min_s == 5
+    assert cfg.retry_max_s == 60
+    assert cfg.token_margin == 1.25
+
+
+def test_knobs_from_file(tmp_path):
+    path = _write(
+        tmp_path,
+        {
+            "target_kv_cache_pct": 70.5,
+            "retry_min_s": 10,
+            "retry_max_s": 120,
+            "token_margin": 2.0,
+        },
+    )
+    cfg = load_config(path=path, env={})
+    assert cfg.target_kv_cache_pct == 70.5
+    assert cfg.retry_min_s == 10
+    assert cfg.retry_max_s == 120
+    assert cfg.token_margin == 2.0
+
+
+def test_knobs_env_override_wins_over_file(tmp_config_file):
+    env = {
+        "TARGET_KV_CACHE_PCT": "90.5",
+        "RETRY_MIN_S": "7",
+        "RETRY_MAX_S": "45",
+        "TOKEN_MARGIN": "1.5",
+    }
+    cfg = load_config(path=tmp_config_file, env=env)
+    assert cfg.target_kv_cache_pct == 90.5
+    assert cfg.retry_min_s == 7
+    assert cfg.retry_max_s == 45
+    assert cfg.token_margin == 1.5
+
+
+def test_target_kv_cache_pct_zero_raises():
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=None, env={"TARGET_KV_CACHE_PCT": "0"})
+
+
+def test_target_kv_cache_pct_negative_raises(tmp_path):
+    path = _write(tmp_path, {"target_kv_cache_pct": -5})
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=path, env={})
+
+
+def test_target_kv_cache_pct_above_100_raises():
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=None, env={"TARGET_KV_CACHE_PCT": "101"})
+
+
+def test_target_kv_cache_pct_at_100_is_valid():
+    cfg = load_config(path=None, env={"TARGET_KV_CACHE_PCT": "100"})
+    assert cfg.target_kv_cache_pct == 100.0
+
+
+def test_target_kv_cache_pct_nan_raises(tmp_path):
+    p = tmp_path / "nan.yaml"
+    p.write_text("target_kv_cache_pct: .nan\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=str(p), env={})
+
+
+def test_target_kv_cache_pct_inf_raises(tmp_path):
+    p = tmp_path / "inf.yaml"
+    p.write_text("target_kv_cache_pct: .inf\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=str(p), env={})
+
+
+def test_token_margin_below_one_raises():
+    with pytest.raises(ConfigError, match="token_margin"):
+        load_config(path=None, env={"TOKEN_MARGIN": "0.9"})
+
+
+def test_token_margin_at_one_is_valid():
+    cfg = load_config(path=None, env={"TOKEN_MARGIN": "1.0"})
+    assert cfg.token_margin == 1.0
+
+
+def test_token_margin_nan_raises(tmp_path):
+    p = tmp_path / "nan.yaml"
+    p.write_text("token_margin: .nan\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="token_margin"):
+        load_config(path=str(p), env={})
+
+
+def test_retry_min_s_zero_raises():
+    with pytest.raises(ConfigError, match="retry_min_s"):
+        load_config(path=None, env={"RETRY_MIN_S": "0"})
+
+
+def test_retry_min_s_negative_raises(tmp_path):
+    path = _write(tmp_path, {"retry_min_s": -3})
+    with pytest.raises(ConfigError, match="retry_min_s"):
+        load_config(path=path, env={})
+
+
+def test_retry_max_s_below_min_raises():
+    with pytest.raises(ConfigError, match="retry_max_s"):
+        load_config(path=None, env={"RETRY_MIN_S": "10", "RETRY_MAX_S": "5"})
+
+
+def test_retry_max_s_equal_to_min_is_valid():
+    cfg = load_config(path=None, env={"RETRY_MIN_S": "10", "RETRY_MAX_S": "10"})
+    assert cfg.retry_min_s == 10
+    assert cfg.retry_max_s == 10
+
+
+def test_retry_min_s_wrong_file_type_raises(tmp_path):
+    path = _write(tmp_path, {"retry_min_s": "five"})
+    with pytest.raises(ConfigError, match="retry_min_s"):
+        load_config(path=path, env={})
+
+
+def test_retry_max_s_bool_file_type_raises(tmp_path):
+    path = _write(tmp_path, {"retry_max_s": True})
+    with pytest.raises(ConfigError, match="retry_max_s"):
+        load_config(path=path, env={})
+
+
+def test_target_kv_cache_pct_wrong_file_type_raises(tmp_path):
+    path = _write(tmp_path, {"target_kv_cache_pct": "85"})
+    with pytest.raises(ConfigError, match="target_kv_cache_pct"):
+        load_config(path=path, env={})
+
+
+def test_token_margin_wrong_file_type_raises(tmp_path):
+    path = _write(tmp_path, {"token_margin": True})
+    with pytest.raises(ConfigError, match="token_margin"):
+        load_config(path=path, env={})
+
+
+def test_bad_float_env_raises():
+    with pytest.raises(ConfigError, match="TARGET_KV_CACHE_PCT"):
+        load_config(path=None, env={"TARGET_KV_CACHE_PCT": "not-a-number"})
+
+
+def test_bad_float_env_token_margin_raises():
+    with pytest.raises(ConfigError, match="TOKEN_MARGIN"):
+        load_config(path=None, env={"TOKEN_MARGIN": "abc"})
+
+
+def test_bad_int_env_retry_raises():
+    with pytest.raises(ConfigError, match="RETRY_MIN_S"):
+        load_config(path=None, env={"RETRY_MIN_S": "abc"})
+
+
+def test_thresholds_still_validated_when_present():
+    """Thresholds present alongside the knobs are parsed and validated as before."""
+    env = {
+        "THRESHOLDS_JSON": json.dumps([{"kv_pct": 50, "max_context": 4096, "timeout_s": 15}]),
+        "TARGET_KV_CACHE_PCT": "60",
+    }
+    cfg = load_config(path=None, env=env)
+    assert cfg.thresholds == (Threshold(kv_pct=50.0, max_context=4096, timeout_s=15),)
+    assert cfg.target_kv_cache_pct == 60.0
+    with pytest.raises(ConfigError, match="kv_pct"):
+        load_config(
+            path=None,
+            env=_env_with_thresholds([{"kv_pct": 150, "max_context": 1, "timeout_s": 1}]),
+        )

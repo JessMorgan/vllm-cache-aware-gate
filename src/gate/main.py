@@ -3,6 +3,11 @@
 The poller is started by the app lifespan (which uvicorn triggers), so
 :func:`main` does not start it separately. On a configuration error the
 process exits non-zero so the container does not start with a bad config.
+
+After a successful config load, :func:`main` logs the autoconfig knobs
+(target KV-cache %, token margin, retry min–max) and the tiered tier count
+(or the none case) at INFO so the operator can confirm the active policy.
+There is no CLI: argv is ignored (autoconfig is always on).
 """
 
 from __future__ import annotations
@@ -37,6 +42,18 @@ def main() -> None:
     except ConfigError as e:
         log.error("invalid configuration: %s", e)
         raise SystemExit(1) from e
+
+    log.info(
+        "autoconfig: target %s%% KV cache, token margin %s, retry %d-%ds",
+        cfg.target_kv_cache_pct,
+        cfg.token_margin,
+        cfg.retry_min_s,
+        cfg.retry_max_s,
+    )
+    if cfg.thresholds:
+        log.info("tiered policy: %d threshold tier(s)", len(cfg.thresholds))
+    else:
+        log.info("tiered policy: none — autoconfig only")
 
     client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
     cache = MetricsCache()
