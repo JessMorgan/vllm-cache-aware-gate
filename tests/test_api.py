@@ -34,7 +34,7 @@ from prometheus_client.parser import text_string_to_metric_families
 
 from gate.app import _poller_fatal, create_app
 from gate.config import Backend, GateConfig, Threshold
-from gate.metrics import CapacityCache, CapacityUnavailableError, KvRemaining, MetricsCache
+from gate.metrics import CapacityCache, KvRemaining, MetricsCache
 from gate.models import ModelRegistry
 from gate.tokens import estimate_context_tokens
 
@@ -103,11 +103,10 @@ class FakeVLLM:
 
 
 def make_config(stale_after_s: float = 60.0) -> GateConfig:
-    """A GateConfig with two tiers (50/4096/15, 80/1024/30) and a large
-    ``stale_after_s`` so a freshly-updated cache is not stale."""
+    """A single-backend GateConfig (one ``backends`` entry, decision 6) with
+    two tiers (50/4096/15, 80/1024/30) and a large ``stale_after_s`` so a
+    freshly-updated cache is not stale."""
     return GateConfig(
-        vllm_host="vllm",
-        vllm_port=9000,
         listen_host="127.0.0.1",
         listen_port=8080,
         metrics_poll_interval_s=1.5,
@@ -115,6 +114,7 @@ def make_config(stale_after_s: float = 60.0) -> GateConfig:
         chars_per_token=4,
         default_max_tokens=256,
         thresholds=(Threshold(50.0, 4096, 15), Threshold(80.0, 1024, 30)),
+        backends=(Backend(name="vllm", host="vllm", port=9000, default=True),),
     )
 
 
@@ -143,11 +143,9 @@ def build_app(
 ) -> TestClient:
     """Build the app with the fake upstream and return a TestClient (lifespan off).
 
-    Single-backend (legacy) helper: the app synthesizes ONE backend state from
-    ``cfg.vllm_host``/``cfg.vllm_port``; the test-controlled caches are
-    swapped into ``app.state.backends[0]`` before any request is made, so all
-    existing single-backend tests exercise the legacy synthesized-backend
-    path unchanged.
+    Single-backend helper: the app builds ONE backend state from the single
+    entry in ``cfg.backends`` (decision 6); the test-controlled caches are
+    swapped into ``app.state.backends[0]`` before any request is made.
     """
     upstream = (fake if fake is not None else FakeVLLM()).client
     app = create_app(cfg, upstream=upstream, start_poller=False)
@@ -311,8 +309,8 @@ def test_healthz() -> None:
     data = resp.json()
     assert data["status"] == "ok"
     backends = data["backends"]
-    assert len(backends) == 1  # legacy synthesized backend
-    assert backends[0]["name"] == "vllm:9000"
+    assert len(backends) == 1  # the single backends config entry
+    assert backends[0]["name"] == "vllm"
     assert "metrics_age_s" in backends[0]
     assert backends[0]["kv_usage"] == pytest.approx(0.42)
 
@@ -753,8 +751,8 @@ def test_metrics_remaining_gauge_reflects_decrements() -> None:
         resp = client.post("/v1/chat/completions", content=body, headers=JSON_HEADERS)
         assert resp.status_code == 200
         post = client.get("/metrics").text
-    assert 'gate_kv_cache_remaining_tokens{backend="vllm:9000"} 500.0' in pre
-    assert 'gate_kv_cache_remaining_tokens{backend="vllm:9000"} 148.0' in post
+    assert 'gate_kv_cache_remaining_tokens{backend="vllm"} 500.0' in pre
+    assert 'gate_kv_cache_remaining_tokens{backend="vllm"} 148.0' in post
 
 
 def test_metrics_remaining_gauge_nan_when_never_anchored() -> None:
@@ -762,23 +760,26 @@ def test_metrics_remaining_gauge_nan_when_never_anchored() -> None:
     cache = MetricsCache()
     with build_app(make_config(), cache, fake) as client:
         body = client.get("/metrics").text
-    assert 'gate_kv_cache_remaining_tokens{backend="vllm:9000"} NaN' in body
+    assert 'gate_kv_cache_remaining_tokens{backend="vllm"} NaN' in body
 
 
 # --- fatal done-callback -------------------------------------------------------
 
 
 async def test_poller_fatal_exits_on_task_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A poller task that dies with an exception triggers os._exit(1)."""
+    """A poller task that dies with an unexpected exception triggers
+    os._exit(1). (The capacity-missing path no longer raises — it fails open
+    per backend, decision 10 — so the fatal callback now fires only on an
+    unexpected task death.)"""
     exited: list[int] = []
     monkeypatch.setattr("gate.app.os._exit", exited.append)
 
     async def boom() -> None:
-        raise CapacityUnavailableError("no capacity gauge")
+        raise RuntimeError("unexpected task death")
 
     task = asyncio.create_task(boom())
     task.add_done_callback(_poller_fatal)
-    with pytest.raises(CapacityUnavailableError):
+    with pytest.raises(RuntimeError):
         await task
     await asyncio.sleep(0)  # let the done callback run
     assert exited == [1]
@@ -849,8 +850,6 @@ class MultiFakeVLLM:
 def multi_config() -> GateConfig:
     """A two-backend config: qwen (default, host a) and llama (host b)."""
     return GateConfig(
-        vllm_host="unused",
-        vllm_port=9000,
         listen_host="127.0.0.1",
         listen_port=8080,
         metrics_poll_interval_s=1.5,

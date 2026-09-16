@@ -14,15 +14,14 @@ from dataclasses import replace
 from prometheus_client import CollectorRegistry
 from prometheus_client.parser import text_string_to_metric_families
 
-from gate.config import GateConfig, Threshold
+from gate.config import Backend, GateConfig, Threshold
 from gate.stats import GateStats
 
 
 def make_config() -> GateConfig:
-    """A GateConfig with two tiers (50/4096/15, 80/1024/30)."""
+    """A single-backend GateConfig (decision 6) with two tiers (50/4096/15,
+    80/1024/30)."""
     return GateConfig(
-        vllm_host="vllm",
-        vllm_port=9000,
         listen_host="127.0.0.1",
         listen_port=8080,
         metrics_poll_interval_s=1.5,
@@ -30,6 +29,7 @@ def make_config() -> GateConfig:
         chars_per_token=4,
         default_max_tokens=256,
         thresholds=(Threshold(50.0, 4096, 15), Threshold(80.0, 1024, 30)),
+        backends=(Backend(name="vllm", host="vllm", port=9000, default=True),),
     )
 
 
@@ -238,14 +238,12 @@ class TestConfigInfo:
         stats = make_stats()
         text = stats.render().decode()
         assert "gate_config_info{" in text
-        assert 'vllm_host="vllm"' in text
         assert "thresholds_json=" in text
+        assert "backends_json=" in text
 
     def test_label_values(self) -> None:
         stats = make_stats()
         labels = _config_labels(stats)
-        assert labels["vllm_host"] == "vllm"
-        assert labels["vllm_port"] == "9000"
         assert labels["listen_host"] == "127.0.0.1"
         assert labels["listen_port"] == "8080"
         assert labels["metrics_poll_interval_s"] == "1.5"
@@ -254,16 +252,19 @@ class TestConfigInfo:
         assert labels["default_max_tokens"] == "256"
         # Compact JSON of the two thresholds as [kv_pct, max_context, timeout_s].
         assert labels["thresholds_json"] == json.dumps([[50.0, 4096, 15], [80.0, 1024, 30]])
+        # The removed vllm_host/vllm_port labels are gone (decision 6).
+        assert "vllm_host" not in labels
+        assert "vllm_port" not in labels
 
-    def test_backends_json_legacy_single_backend(self) -> None:
-        # cfg.backends empty -> the legacy single backend implied by
-        # vllm_host/vllm_port is serialized (name = "host:port", default).
+    def test_backends_json_single_backend(self) -> None:
+        # make_config() has one backends entry; it is serialized with its
+        # name/host/port/default flag and no overrides.
         stats = make_stats()
         labels = _config_labels(stats)
         backends = json.loads(labels["backends_json"])
         assert backends == [
             {
-                "name": "vllm:9000",
+                "name": "vllm",
                 "host": "vllm",
                 "port": 9000,
                 "default": True,

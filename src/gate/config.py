@@ -4,12 +4,16 @@ Reads a YAML config file (if any) and applies environment overrides, then
 validates the result. All failures raise :class:`ConfigError` with a clear
 message so startup fails fast.
 
-Multi-backend (additive): the optional ``backends:`` list (file) /
-``BACKENDS_JSON`` (env, wins over the file entirely, mirroring
-``THRESHOLDS_JSON``) configures one or more vLLM backends. Each backend may
-override the tiered ``thresholds`` and the four autoconfig knobs; ``None``
-means "use the global default". The legacy ``vllm_host``/``vllm_port`` keys
-remain valid alongside ``backends:``.
+Multi-backend (breaking change, docs/plans/multi-backend.md decision 6):
+the ``backends:`` list (file) / ``BACKENDS_JSON`` (env, wins over the file
+entirely, mirroring ``THRESHOLDS_JSON``) configures the vLLM backends and is
+**required** — at least one backend (name + host + port) must always be
+configured, because the gate has no other way to learn its upstream. Each
+backend may override the tiered ``thresholds`` and the four autoconfig
+knobs; ``None`` means "use the global default". The legacy
+``vllm_host``/``vllm_port`` keys and the ``VLLM_HOST``/``VLLM_PORT`` env
+vars are **removed**: a config containing them fails with an unknown-key
+:class:`ConfigError` naming the migration to ``backends:``.
 """
 
 from __future__ import annotations
@@ -26,10 +30,11 @@ import yaml
 DEFAULT_CONFIG_PATH = "/etc/gate/config.yaml"
 
 # Known top-level config keys, mapped to the GateConfig field they populate.
+# ``vllm_host``/``vllm_port`` are deliberately absent: they were removed in
+# the multi-backend breaking change (decision 6) and now fail with the
+# unknown-key error (see :func:`_merge_file` for the migration hint).
 _KNOWN_KEYS: frozenset[str] = frozenset(
     {
-        "vllm_host",
-        "vllm_port",
         "listen_host",
         "listen_port",
         "metrics_poll_interval_s",
@@ -106,10 +111,13 @@ class Backend:
 
 @dataclass(frozen=True)
 class GateConfig:
-    """Fully validated gate configuration."""
+    """Fully validated gate configuration.
 
-    vllm_host: str = "vllm"
-    vllm_port: int = 8000
+    ``backends`` is the REQUIRED upstream list (decision 6): the gate has no
+    other way to learn its upstream, so an empty ``backends`` tuple is a
+    validation error, not a valid zero-config state.
+    """
+
     listen_host: str = "0.0.0.0"
     listen_port: int = 8000
     metrics_poll_interval_s: float = 2.0
@@ -263,20 +271,28 @@ def _load_file(path: str) -> dict[str, Any]:
 
 
 def _merge_file(data: GateConfig, raw: dict[str, Any], source: str) -> GateConfig:
-    """Merge known keys from a parsed config mapping over the defaults."""
+    """Merge known keys from a parsed config mapping over the defaults.
+
+    The legacy ``vllm_host``/``vllm_port`` keys are no longer known keys
+    (decision 6); a config containing them fails with a migration hint
+    instead of the generic unknown-key message.
+    """
     unknown = set(raw) - _KNOWN_KEYS
     if unknown:
+        legacy = sorted(unknown & {"vllm_host", "vllm_port"})
+        if legacy:
+            verb = "is" if len(legacy) == 1 else "are"
+            raise ConfigError(
+                f"{source}: {', '.join(legacy)} {verb} no longer supported; "
+                f"use the 'backends' list (or the BACKENDS_JSON env var)"
+            )
         raise ConfigError(f"{source}: unknown config key(s): {sorted(unknown)}")
     updates: dict[str, Any] = {}
-    if "vllm_host" in raw:
-        if not isinstance(raw["vllm_host"], str):
-            raise ConfigError(f"{source}: 'vllm_host' must be a string")
-        updates["vllm_host"] = raw["vllm_host"]
     if "listen_host" in raw:
         if not isinstance(raw["listen_host"], str):
             raise ConfigError(f"{source}: 'listen_host' must be a string")
         updates["listen_host"] = raw["listen_host"]
-    for key in ("vllm_port", "listen_port", "chars_per_token", "default_max_tokens"):
+    for key in ("listen_port", "chars_per_token", "default_max_tokens"):
         if key in raw:
             if not _is_int(raw[key]):
                 raise ConfigError(f"{source}: '{key}' must be an integer")
@@ -326,17 +342,15 @@ def _parse_env_float(env: Mapping[str, str], name: str) -> float | None:
 
 
 def _apply_env(data: GateConfig, env: Mapping[str, str]) -> GateConfig:
-    """Apply environment overrides (env wins over file and defaults)."""
+    """Apply environment overrides (env wins over file and defaults).
+
+    ``VLLM_HOST``/``VLLM_PORT`` are no longer read (decision 6): they were
+    the single-backend shorthand, removed with ``vllm_host``/``vllm_port``.
+    """
     updates: dict[str, Any] = {}
-    host = env.get("VLLM_HOST")
-    if host is not None:
-        updates["vllm_host"] = host
     listen_host = env.get("LISTEN_HOST")
     if listen_host is not None:
         updates["listen_host"] = listen_host
-    vllm_port = _parse_env_int(env, "VLLM_PORT")
-    if vllm_port is not None:
-        updates["vllm_port"] = vllm_port
     listen_port = _parse_env_int(env, "LISTEN_PORT")
     if listen_port is not None:
         updates["listen_port"] = listen_port
@@ -376,7 +390,7 @@ def _apply_env(data: GateConfig, env: Mapping[str, str]) -> GateConfig:
 def _validate(data: GateConfig) -> None:
     """Validate the final config; raise ConfigError on any violation."""
     # thresholds are optional: an empty/absent tiered policy just means the
-    # tiered layer always allows (zero-config is valid).
+    # tiered layer always allows (backends, however, are required — decision 6).
     seen_kv: set[float] = set()
     for i, t in enumerate(data.thresholds):
         where = f"thresholds[{i}]"
@@ -389,9 +403,8 @@ def _validate(data: GateConfig) -> None:
         if t.kv_pct in seen_kv:
             raise ConfigError(f"{where}: duplicate kv_pct {t.kv_pct}")
         seen_kv.add(t.kv_pct)
-    for name, port in (("vllm_port", data.vllm_port), ("listen_port", data.listen_port)):
-        if not 1 <= port <= 65535:
-            raise ConfigError(f"{name} must be in [1, 65535], got {port}")
+    if not 1 <= data.listen_port <= 65535:
+        raise ConfigError(f"listen_port must be in [1, 65535], got {data.listen_port}")
     if data.chars_per_token < 1:
         raise ConfigError(f"chars_per_token must be >= 1, got {data.chars_per_token}")
     if data.default_max_tokens < 0:
@@ -427,16 +440,19 @@ def _validate(data: GateConfig) -> None:
 
 
 def _validate_backends(data: GateConfig) -> None:
-    """Validate the optional ``backends`` list (no-op when absent).
+    """Validate the REQUIRED ``backends`` list.
 
-    Legacy single-backend configs (no ``backends``) are untouched. When
+    ``backends`` must be non-empty (decision 6): the gate has no other way
+    to learn its upstream, so an empty list is a startup error. When
     present: names are unique and non-empty, ports are in 1-65535, model ids
     are globally unique across backends, at most one backend is
     ``default: true``, and each per-backend knob, when present, satisfies the
     same ranges as the global default.
     """
     if not data.backends:
-        return
+        raise ConfigError(
+            "at least one backend is required (file key 'backends' or the BACKENDS_JSON env var)"
+        )
     seen_names: set[str] = set()
     seen_models: dict[str, str] = {}  # model id -> backend name
     defaults = 0
@@ -509,6 +525,9 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     - ``env``: overrides applied last; defaults to ``os.environ``.
       ``BACKENDS_JSON`` (a JSON list of backend objects) REPLACES the file's
       ``backends:`` entirely, mirroring ``THRESHOLDS_JSON``.
+
+    The ``backends`` list is required (decision 6): a config with no
+    ``backends`` (file or ``BACKENDS_JSON``) raises :class:`ConfigError`.
 
     Raises :class:`ConfigError` on any invalid input or validation failure.
     """

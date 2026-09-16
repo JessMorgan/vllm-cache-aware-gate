@@ -4,10 +4,13 @@ The poller is started by the app lifespan (which uvicorn triggers), so
 :func:`main` does not start it separately. On a configuration error the
 process exits non-zero so the container does not start with a bad config.
 
-After a successful config load, :func:`main` logs the autoconfig knobs
-(target KV-cache %, token margin, retry min–max) and the tiered tier count
-(or the none case) at INFO so the operator can confirm the active policy.
-There is no CLI: argv is ignored (autoconfig is always on).
+After a successful config load, :func:`main` logs one INFO line per
+configured backend — name, host:port, the default flag, the tiered tier
+count (or "none — autoconfig only"), and the four autoconfig knobs with
+"(override)" marking the per-backend values that are explicitly set (an
+unmarked value is the global default) — so the operator can confirm the
+active per-backend policy. There is no CLI: argv is ignored (autoconfig is
+always on).
 """
 
 from __future__ import annotations
@@ -42,17 +45,42 @@ def main() -> None:
         log.error("invalid configuration: %s", e)
         raise SystemExit(1) from e
 
-    log.info(
-        "autoconfig: target %s%% KV cache, token margin %s, retry %d-%ds",
-        cfg.target_kv_cache_pct,
-        cfg.token_margin,
-        cfg.retry_min_s,
-        cfg.retry_max_s,
-    )
-    if cfg.thresholds:
-        log.info("tiered policy: %d threshold tier(s)", len(cfg.thresholds))
-    else:
-        log.info("tiered policy: none — autoconfig only")
+    # One INFO line per backend (decision 6): name, host:port, default flag,
+    # tier count, and the four autoconfig knobs — "(override)" marks a
+    # per-backend value; an unmarked value is the global default.
+    for b in cfg.backends:
+        # Effective tiers: the per-backend override, else the global
+        # thresholds (app.py resolves the same way) — so a backend that
+        # inherits the global tiers is logged with that tier count, not
+        # "none — autoconfig only".
+        effective = b.thresholds if b.thresholds is not None else cfg.thresholds
+        tiers = f"{len(effective)} tier(s)" if effective else "none — autoconfig only"
+        target = (
+            f"{b.target_kv_cache_pct}% (override)"
+            if b.target_kv_cache_pct is not None
+            else f"{cfg.target_kv_cache_pct}%"
+        )
+        margin = (
+            f"{b.token_margin} (override)" if b.token_margin is not None else f"{cfg.token_margin}"
+        )
+        retry_min = (
+            f"{b.retry_min_s} (override)" if b.retry_min_s is not None else f"{cfg.retry_min_s}"
+        )
+        retry_max = (
+            f"{b.retry_max_s} (override)" if b.retry_max_s is not None else f"{cfg.retry_max_s}"
+        )
+        log.info(
+            "backend %r (%s:%d)%s: %s, target %s, margin %s, retry %s-%ss",
+            b.name,
+            b.host,
+            b.port,
+            " [default]" if b.default else "",
+            tiers,
+            target,
+            margin,
+            retry_min,
+            retry_max,
+        )
 
     client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
     app = create_app(cfg, upstream=client, start_poller=True)

@@ -281,17 +281,6 @@ class CapacityCache:
         return (time.monotonic() if now is None else now) - self._fetched_at
 
 
-class CapacityUnavailableError(RuntimeError):
-    """Raised by the poller when an observed ``/metrics`` body lacks a usable KV-cache capacity.
-
-    A live vLLM whose body lacks a usable KV-cache capacity (the standalone
-    ``vllm:kv_cache_size_tokens`` gauge or the ``kv_cache_size_tokens`` label
-    on ``vllm:cache_config_info``) cannot anchor the remaining-KV counter, so
-    the gate fails closed (the app exits with status 1). A merely unreachable
-    vLLM never raises this — that path fails open (invariant #1).
-    """
-
-
 class KvRemaining:
     """In-memory estimate of the KV tokens still available up to the target.
 

@@ -214,30 +214,14 @@ class GateStats:
         backend the name, host, port, default flag, and which knobs are
         overridden per-backend (vs the global default). The ``models:`` lists
         are deliberately omitted — they are discovered at runtime and would
-        go stale (keep the info metric small and startup-static). When
-        ``cfg.backends`` is empty, the legacy single backend implied by
-        ``vllm_host``/``vllm_port`` is serialized instead.
+        go stale (keep the info metric small and startup-static).
+        ``cfg.backends`` is always non-empty (config validation, decision 6).
         """
         thresholds_json = json.dumps(
             [[t.kv_pct, t.max_context, t.timeout_s] for t in cfg.thresholds]
         )
-        backends_json = json.dumps(
-            [_backend_info(b) for b in cfg.backends]
-            if cfg.backends
-            else [
-                {
-                    "name": f"{cfg.vllm_host}:{cfg.vllm_port}",
-                    "host": cfg.vllm_host,
-                    "port": cfg.vllm_port,
-                    "default": True,
-                    "overrides": [],
-                }
-            ],
-            separators=(",", ":"),
-        )
+        backends_json = json.dumps([_backend_info(b) for b in cfg.backends], separators=(",", ":"))
         labels: dict[str, str] = {
-            "vllm_host": str(cfg.vllm_host),
-            "vllm_port": str(cfg.vllm_port),
             "listen_host": str(cfg.listen_host),
             "listen_port": str(cfg.listen_port),
             "metrics_poll_interval_s": str(cfg.metrics_poll_interval_s),

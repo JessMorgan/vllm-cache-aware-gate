@@ -120,14 +120,14 @@ _METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 class BackendState:
     """Per-backend admission state (docs/plans/multi-backend.md §2.4).
 
-    One instance per configured backend (or one synthesized from the legacy
-    ``vllm_host``/``vllm_port`` when ``cfg.backends`` is empty). ``thresholds``
-    and ``auto_policy`` are the *resolved* values (per-backend override, else
-    the global default); ``target_frac`` is the single percentage→fraction
-    conversion (gotcha #14) done once at wiring. ``models`` is the explicit
-    mnemonic tuple (empty = auto-adopt from ``/v1/models``).
-    ``capacity_unavailable`` is the per-backend alert flag flipped by the
-    poller's ``capacity_unavailable`` callback (decision 10).
+    One instance per configured backend (``cfg.backends`` is always
+    non-empty — decision 6). ``thresholds`` and ``auto_policy`` are the
+    *resolved* values (per-backend override, else the global default);
+    ``target_frac`` is the single percentage→fraction conversion (gotcha
+    #14) done once at wiring. ``models`` is the explicit mnemonic tuple
+    (empty = auto-adopt from ``/v1/models``). ``capacity_unavailable`` is
+    the per-backend alert flag flipped by the poller's
+    ``capacity_unavailable`` callback (decision 10).
     """
 
     name: str
@@ -244,69 +244,45 @@ def _poller_fatal(task: asyncio.Task[None]) -> None:
 def _build_backend_states(cfg: GateConfig) -> list[BackendState]:
     """Build the per-backend state list from the config.
 
-    When ``cfg.backends`` is non-empty, one :class:`BackendState` per
-    configured backend, with fresh caches/counter and the resolved
-    per-backend-or-global knobs. When it is empty (legacy config), ONE
-    synthesized state from ``vllm_host``/``vllm_port`` (name
-    ``f"{host}:{port}"``, default, the global thresholds and knobs) — the
-    legacy path is removed in a later segment.
+    One :class:`BackendState` per configured backend, with fresh
+    caches/counter and the resolved per-backend-or-global knobs.
+    ``cfg.backends`` is always non-empty (config validation, decision 6).
     """
-    states: list[BackendState] = []
-    if cfg.backends:
-        # At most one backend is flagged default: true (config validation);
-        # the default backend is the fallback for unknown models (decision 4),
-        # falling back to the first entry when none is flagged.
-        default_name = next((b.name for b in cfg.backends if b.default), cfg.backends[0].name)
-        for b in cfg.backends:
-            states.append(
-                BackendState(
-                    name=b.name,
-                    host=b.host,
-                    port=b.port,
-                    base_url=f"http://{b.host}:{b.port}",
-                    is_default=(b.name == default_name),
-                    models=b.models,
-                    cache=MetricsCache(),
-                    capacity_cache=CapacityCache(),
-                    counter=KvRemaining(),
-                    thresholds=b.thresholds if b.thresholds is not None else cfg.thresholds,
-                    target_pct=b.target_kv_cache_pct
-                    if b.target_kv_cache_pct is not None
-                    else cfg.target_kv_cache_pct,
-                    # The single percentage→fraction step (gotcha #14), done
-                    # once at wiring per backend.
-                    target_frac=(
-                        b.target_kv_cache_pct
-                        if b.target_kv_cache_pct is not None
-                        else cfg.target_kv_cache_pct
-                    )
-                    / 100.0,
-                    auto_policy=AutoPolicy(
-                        b.token_margin if b.token_margin is not None else cfg.token_margin,
-                        b.retry_min_s if b.retry_min_s is not None else cfg.retry_min_s,
-                        b.retry_max_s if b.retry_max_s is not None else cfg.retry_max_s,
-                    ),
-                )
+    # At most one backend is flagged default: true (config validation);
+    # the default backend is the fallback for unknown models (decision 4),
+    # falling back to the first entry when none is flagged.
+    default_name = next((b.name for b in cfg.backends if b.default), cfg.backends[0].name)
+    return [
+        BackendState(
+            name=b.name,
+            host=b.host,
+            port=b.port,
+            base_url=f"http://{b.host}:{b.port}",
+            is_default=(b.name == default_name),
+            models=b.models,
+            cache=MetricsCache(),
+            capacity_cache=CapacityCache(),
+            counter=KvRemaining(),
+            thresholds=b.thresholds if b.thresholds is not None else cfg.thresholds,
+            target_pct=b.target_kv_cache_pct
+            if b.target_kv_cache_pct is not None
+            else cfg.target_kv_cache_pct,
+            # The single percentage→fraction step (gotcha #14), done
+            # once at wiring per backend.
+            target_frac=(
+                b.target_kv_cache_pct
+                if b.target_kv_cache_pct is not None
+                else cfg.target_kv_cache_pct
             )
-    else:
-        states.append(
-            BackendState(
-                name=f"{cfg.vllm_host}:{cfg.vllm_port}",
-                host=cfg.vllm_host,
-                port=cfg.vllm_port,
-                base_url=f"http://{cfg.vllm_host}:{cfg.vllm_port}",
-                is_default=True,
-                models=(),
-                cache=MetricsCache(),
-                capacity_cache=CapacityCache(),
-                counter=KvRemaining(),
-                thresholds=cfg.thresholds,
-                target_pct=cfg.target_kv_cache_pct,
-                target_frac=cfg.target_kv_cache_pct / 100.0,
-                auto_policy=AutoPolicy(cfg.token_margin, cfg.retry_min_s, cfg.retry_max_s),
-            )
+            / 100.0,
+            auto_policy=AutoPolicy(
+                b.token_margin if b.token_margin is not None else cfg.token_margin,
+                b.retry_min_s if b.retry_min_s is not None else cfg.retry_min_s,
+                b.retry_max_s if b.retry_max_s is not None else cfg.retry_max_s,
+            ),
         )
-    return states
+        for b in cfg.backends
+    ]
 
 
 def create_app(

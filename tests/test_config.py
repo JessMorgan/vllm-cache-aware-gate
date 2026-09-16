@@ -22,8 +22,6 @@ def _write(tmp_path, data: object, name: str = "config.yaml") -> str:
 
 def test_load_from_valid_file(tmp_config_file):
     cfg = load_config(path=tmp_config_file, env={})
-    assert cfg.vllm_host == "vllm"
-    assert cfg.vllm_port == 9000
     assert cfg.listen_host == "127.0.0.1"
     assert cfg.listen_port == 8080
     assert cfg.metrics_poll_interval_s == 1.5
@@ -38,10 +36,14 @@ def test_load_from_valid_file(tmp_config_file):
 
 def test_defaults_fill_missing_file_keys(tmp_path):
     """Only some keys in the file; the rest come from defaults."""
-    path = _write(tmp_path, {"thresholds": [{"kv_pct": 10, "max_context": 1, "timeout_s": 1}]})
+    path = _write(
+        tmp_path,
+        {
+            "backends": [{"name": "b1", "host": "h1", "port": 1}],
+            "thresholds": [{"kv_pct": 10, "max_context": 1, "timeout_s": 1}],
+        },
+    )
     cfg = load_config(path=path, env={})
-    assert cfg.vllm_host == "vllm"
-    assert cfg.vllm_port == 8000
     assert cfg.listen_port == 8000
     assert cfg.chars_per_token == 4
     assert cfg.default_max_tokens == 256
@@ -49,24 +51,43 @@ def test_defaults_fill_missing_file_keys(tmp_path):
 
 def test_env_overrides_win_over_file(tmp_config_file):
     env = {
-        "VLLM_HOST": "other-host",
-        "VLLM_PORT": "9999",
         "LISTEN_HOST": "0.0.0.0",
         "LISTEN_PORT": "7000",
         "THRESHOLDS_JSON": json.dumps([{"kv_pct": 90, "max_context": 512, "timeout_s": 5}]),
     }
     cfg = load_config(path=tmp_config_file, env=env)
-    assert cfg.vllm_host == "other-host"
-    assert cfg.vllm_port == 9999
     assert cfg.listen_host == "0.0.0.0"
     assert cfg.listen_port == 7000
     assert cfg.thresholds == (Threshold(kv_pct=90.0, max_context=512, timeout_s=5),)
 
 
-def test_zero_config_no_file_no_env_is_valid(tmp_path, monkeypatch):
-    """No file and no env: zero-config is valid with defaults and no thresholds."""
+def test_vllm_host_port_env_vars_no_longer_honored(tmp_config_file, tmp_path, monkeypatch):
+    """VLLM_HOST/VLLM_PORT are removed (decision 6): they no longer affect the
+    config, and a config with only those env vars (no backends) fails."""
     monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.yaml"))
-    cfg = load_config(path=None, env={})
+    env = {"VLLM_HOST": "other-host", "VLLM_PORT": "9999"}
+    # The sample file's backends are unaffected by the dead env vars.
+    cfg = load_config(path=tmp_config_file, env=env)
+    assert cfg.backends == (Backend(name="vllm", host="vllm", port=9000, default=True),)
+    # No file and no backends: the dead env vars cannot supply an upstream.
+    with pytest.raises(ConfigError, match="at least one backend is required"):
+        load_config(path=None, env=env)
+
+
+def test_no_file_no_env_requires_backends(tmp_path, monkeypatch):
+    """No file and no env: the gate has no upstream to learn, so it fails
+    (decision 6 supersedes the old zero-config property)."""
+    monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.yaml"))
+    with pytest.raises(ConfigError, match="at least one backend is required"):
+        load_config(path=None, env={})
+
+
+def test_minimal_valid_config_is_backends_only(tmp_path):
+    """The minimal valid config is a single backends entry; everything else
+    comes from defaults."""
+    path = _write(tmp_path, {"backends": [{"name": "b1", "host": "h1", "port": 8000}]})
+    cfg = load_config(path=path, env={})
+    assert cfg.backends == (Backend(name="b1", host="h1", port=8000),)
     assert cfg.thresholds == ()
     assert cfg.target_kv_cache_pct == 85.0
     assert cfg.retry_min_s == 5
@@ -76,9 +97,13 @@ def test_zero_config_no_file_no_env_is_valid(tmp_path, monkeypatch):
 
 def test_no_thresholds_file_is_valid(tmp_path):
     """A file without a thresholds key loads fine (thresholds are optional)."""
-    path = _write(tmp_path, {"vllm_host": "my-vllm"})
+    path = _write(
+        tmp_path,
+        {
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+        },
+    )
     cfg = load_config(path=path, env={})
-    assert cfg.vllm_host == "my-vllm"
     assert cfg.thresholds == ()
     assert cfg.target_kv_cache_pct == 85.0
     assert cfg.retry_min_s == 5
@@ -89,7 +114,11 @@ def test_no_thresholds_file_is_valid(tmp_path):
 def test_default_config_path_used_when_present(tmp_path, monkeypatch):
     """path=None falls back to DEFAULT_CONFIG_PATH when that file exists."""
     default_path = _write(
-        tmp_path, {"thresholds": [{"kv_pct": 5, "max_context": 2, "timeout_s": 2}]}
+        tmp_path,
+        {
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+            "thresholds": [{"kv_pct": 5, "max_context": 2, "timeout_s": 2}],
+        },
     )
     monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", default_path)
     cfg = load_config(path=None, env={})
@@ -102,7 +131,10 @@ def test_valid_multi_threshold_config_is_tuple():
         {"kv_pct": 0, "max_context": 1, "timeout_s": 1},
         {"kv_pct": 100, "max_context": 2, "timeout_s": 2},
     ]
-    env = {"THRESHOLDS_JSON": json.dumps(raw)}
+    env = {
+        "THRESHOLDS_JSON": json.dumps(raw),
+        "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+    }
     cfg = load_config(path=None, env=env)
     assert isinstance(cfg, GateConfig)
     assert isinstance(cfg.thresholds, tuple)
@@ -129,11 +161,54 @@ def test_unknown_top_level_key_raises(tmp_path):
     path = _write(
         tmp_path,
         {
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
             "bogus_key": True,
         },
     )
     with pytest.raises(ConfigError, match="unknown config key"):
+        load_config(path=path, env={})
+
+
+def test_legacy_vllm_host_key_fails_with_migration_hint(tmp_path):
+    """The removed vllm_host key fails with a helpful migration message
+    (decision 6), not the generic unknown-key error."""
+    path = _write(
+        tmp_path,
+        {
+            "vllm_host": "my-vllm",
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+        },
+    )
+    with pytest.raises(ConfigError, match=r"vllm_host is no longer supported"):
+        load_config(path=path, env={})
+
+
+def test_legacy_vllm_port_key_fails_with_migration_hint(tmp_path):
+    path = _write(
+        tmp_path,
+        {
+            "vllm_port": 9999,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+        },
+    )
+    with pytest.raises(ConfigError, match=r"vllm_port is no longer supported"):
+        load_config(path=path, env={})
+
+
+def test_legacy_vllm_host_without_backends_fails(tmp_path):
+    """A legacy single-backend config (vllm_host/vllm_port, no backends) now
+    fails: the migration hint fires first, and even after migrating, no
+    backends means 'at least one backend is required'."""
+    path = _write(tmp_path, {"vllm_host": "my-vllm", "vllm_port": 9000})
+    with pytest.raises(ConfigError, match=r"vllm_host, vllm_port are no longer supported"):
+        load_config(path=path, env={})
+
+
+def test_empty_backends_list_raises(tmp_path):
+    """An explicit empty backends list is not a valid zero-config state."""
+    path = _write(tmp_path, {"backends": []})
+    with pytest.raises(ConfigError, match="at least one backend is required"):
         load_config(path=path, env={})
 
 
@@ -148,7 +223,11 @@ def test_file_must_be_yaml_mapping(tmp_path):
 
 
 def _env_with_thresholds(thresholds: list[dict]) -> dict[str, str]:
-    return {"THRESHOLDS_JSON": json.dumps(thresholds)}
+    """Thresholds plus a minimal backend (backends are required, decision 6)."""
+    return {
+        "THRESHOLDS_JSON": json.dumps(thresholds),
+        "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+    }
 
 
 def test_kv_pct_above_100_raises():
@@ -207,8 +286,8 @@ def test_threshold_entry_not_object_raises():
 
 
 def test_bad_int_env_raises():
-    with pytest.raises(ConfigError, match="VLLM_PORT"):
-        load_config(path=None, env={"VLLM_PORT": "abc", "THRESHOLDS_JSON": "[]"})
+    with pytest.raises(ConfigError, match="RETRY_MAX_S"):
+        load_config(path=None, env={"RETRY_MAX_S": "abc", "THRESHOLDS_JSON": "[]"})
 
 
 def test_bad_listen_port_env_raises():
@@ -228,7 +307,13 @@ def test_bad_thresholds_json_invalid_json_raises():
 
 def test_empty_thresholds_list_is_valid():
     """An empty thresholds list is valid: the tiered layer simply always allows."""
-    cfg = load_config(path=None, env={"THRESHOLDS_JSON": "[]"})
+    cfg = load_config(
+        path=None,
+        env={
+            "THRESHOLDS_JSON": "[]",
+            "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+        },
+    )
     assert cfg.thresholds == ()
 
 
@@ -240,22 +325,11 @@ def test_listen_port_out_of_range_raises(tmp_path):
         tmp_path,
         {
             "listen_port": 70000,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
         },
     )
     with pytest.raises(ConfigError, match="listen_port"):
-        load_config(path=path, env={})
-
-
-def test_vllm_port_zero_raises(tmp_path):
-    path = _write(
-        tmp_path,
-        {
-            "vllm_port": 0,
-            "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
-        },
-    )
-    with pytest.raises(ConfigError, match="vllm_port"):
         load_config(path=path, env={})
 
 
@@ -264,6 +338,7 @@ def test_chars_per_token_zero_raises(tmp_path):
         tmp_path,
         {
             "chars_per_token": 0,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
         },
     )
@@ -276,6 +351,7 @@ def test_negative_default_max_tokens_raises(tmp_path):
         tmp_path,
         {
             "default_max_tokens": -1,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
         },
     )
@@ -288,6 +364,7 @@ def test_zero_poll_interval_raises(tmp_path):
         tmp_path,
         {
             "metrics_poll_interval_s": 0,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
         },
     )
@@ -300,6 +377,7 @@ def test_zero_stale_after_raises(tmp_path):
         tmp_path,
         {
             "stale_after_s": 0,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
         },
     )
@@ -313,7 +391,7 @@ def test_zero_stale_after_raises(tmp_path):
 def test_boundary_values_accepted():
     """kv_pct exactly 0 and 100, max_context exactly 1, ports 1 and 65535."""
     env = {
-        "VLLM_PORT": "1",
+        "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 1}]),
         "LISTEN_PORT": "65535",
         "THRESHOLDS_JSON": json.dumps(
             [
@@ -323,7 +401,7 @@ def test_boundary_values_accepted():
         ),
     }
     cfg = load_config(path=None, env=env)
-    assert cfg.vllm_port == 1
+    assert cfg.backends[0].port == 1
     assert cfg.listen_port == 65535
     assert cfg.thresholds[0].kv_pct == 0.0
     assert cfg.thresholds[1].kv_pct == 100.0
@@ -339,6 +417,10 @@ def test_nan_poll_interval_raises(tmp_path):
     """NaN is representable in YAML (.nan) but must be rejected by > 0."""
     p = tmp_path / "nan.yaml"
     p.write_text(
+        "backends:\n"
+        "  - name: b1\n"
+        "    host: h1\n"
+        "    port: 8000\n"
         "metrics_poll_interval_s: .nan\n"
         "thresholds:\n"
         "  - kv_pct: 50\n"
@@ -362,12 +444,13 @@ def test_wrong_type_values_raise(tmp_path):
     path = _write(
         tmp_path,
         {
-            "vllm_port": "8000",
+            "listen_port": "8000",
             "chars_per_token": True,
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "thresholds": [{"kv_pct": 50, "max_context": 1, "timeout_s": 1}],
         },
     )
-    with pytest.raises(ConfigError, match="vllm_port"):
+    with pytest.raises(ConfigError, match="listen_port"):
         load_config(path=path, env={})
 
 
@@ -375,7 +458,10 @@ def test_wrong_type_values_raise(tmp_path):
 
 
 def test_knob_defaults():
-    cfg = load_config(path=None, env={})
+    cfg = load_config(
+        path=None,
+        env={"BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}])},
+    )
     assert cfg.target_kv_cache_pct == 85.0
     assert cfg.retry_min_s == 5
     assert cfg.retry_max_s == 60
@@ -386,6 +472,7 @@ def test_knobs_from_file(tmp_path):
     path = _write(
         tmp_path,
         {
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
             "target_kv_cache_pct": 70.5,
             "retry_min_s": 10,
             "retry_max_s": 120,
@@ -415,59 +502,107 @@ def test_knobs_env_override_wins_over_file(tmp_config_file):
 
 def test_target_kv_cache_pct_zero_raises():
     with pytest.raises(ConfigError, match="target_kv_cache_pct"):
-        load_config(path=None, env={"TARGET_KV_CACHE_PCT": "0"})
+        load_config(
+            path=None,
+            env={
+                "TARGET_KV_CACHE_PCT": "0",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_target_kv_cache_pct_negative_raises(tmp_path):
-    path = _write(tmp_path, {"target_kv_cache_pct": -5})
+    path = _write(
+        tmp_path,
+        {"backends": [{"name": "b1", "host": "h1", "port": 8000}], "target_kv_cache_pct": -5},
+    )
     with pytest.raises(ConfigError, match="target_kv_cache_pct"):
         load_config(path=path, env={})
 
 
 def test_target_kv_cache_pct_above_100_raises():
     with pytest.raises(ConfigError, match="target_kv_cache_pct"):
-        load_config(path=None, env={"TARGET_KV_CACHE_PCT": "101"})
+        load_config(
+            path=None,
+            env={
+                "TARGET_KV_CACHE_PCT": "101",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_target_kv_cache_pct_at_100_is_valid():
-    cfg = load_config(path=None, env={"TARGET_KV_CACHE_PCT": "100"})
+    cfg = load_config(
+        path=None,
+        env={
+            "TARGET_KV_CACHE_PCT": "100",
+            "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+        },
+    )
     assert cfg.target_kv_cache_pct == 100.0
 
 
 def test_target_kv_cache_pct_nan_raises(tmp_path):
     p = tmp_path / "nan.yaml"
-    p.write_text("target_kv_cache_pct: .nan\n", encoding="utf-8")
+    p.write_text(
+        "backends:\n  - name: b1\n    host: h1\n    port: 8000\ntarget_kv_cache_pct: .nan\n",
+        encoding="utf-8",
+    )
     with pytest.raises(ConfigError, match="target_kv_cache_pct"):
         load_config(path=str(p), env={})
 
 
 def test_target_kv_cache_pct_inf_raises(tmp_path):
     p = tmp_path / "inf.yaml"
-    p.write_text("target_kv_cache_pct: .inf\n", encoding="utf-8")
+    p.write_text(
+        "backends:\n  - name: b1\n    host: h1\n    port: 8000\ntarget_kv_cache_pct: .inf\n",
+        encoding="utf-8",
+    )
     with pytest.raises(ConfigError, match="target_kv_cache_pct"):
         load_config(path=str(p), env={})
 
 
 def test_token_margin_below_one_raises():
     with pytest.raises(ConfigError, match="token_margin"):
-        load_config(path=None, env={"TOKEN_MARGIN": "0.9"})
+        load_config(
+            path=None,
+            env={
+                "TOKEN_MARGIN": "0.9",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_token_margin_at_one_is_valid():
-    cfg = load_config(path=None, env={"TOKEN_MARGIN": "1.0"})
+    cfg = load_config(
+        path=None,
+        env={
+            "TOKEN_MARGIN": "1.0",
+            "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+        },
+    )
     assert cfg.token_margin == 1.0
 
 
 def test_token_margin_nan_raises(tmp_path):
     p = tmp_path / "nan.yaml"
-    p.write_text("token_margin: .nan\n", encoding="utf-8")
+    p.write_text(
+        "backends:\n  - name: b1\n    host: h1\n    port: 8000\ntoken_margin: .nan\n",
+        encoding="utf-8",
+    )
     with pytest.raises(ConfigError, match="token_margin"):
         load_config(path=str(p), env={})
 
 
 def test_retry_min_s_zero_raises():
     with pytest.raises(ConfigError, match="retry_min_s"):
-        load_config(path=None, env={"RETRY_MIN_S": "0"})
+        load_config(
+            path=None,
+            env={
+                "RETRY_MIN_S": "0",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_retry_min_s_negative_raises(tmp_path):
@@ -478,52 +613,93 @@ def test_retry_min_s_negative_raises(tmp_path):
 
 def test_retry_max_s_below_min_raises():
     with pytest.raises(ConfigError, match="retry_max_s"):
-        load_config(path=None, env={"RETRY_MIN_S": "10", "RETRY_MAX_S": "5"})
+        load_config(
+            path=None,
+            env={
+                "RETRY_MIN_S": "10",
+                "RETRY_MAX_S": "5",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_retry_max_s_equal_to_min_is_valid():
-    cfg = load_config(path=None, env={"RETRY_MIN_S": "10", "RETRY_MAX_S": "10"})
+    cfg = load_config(
+        path=None,
+        env={
+            "RETRY_MIN_S": "10",
+            "RETRY_MAX_S": "10",
+            "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+        },
+    )
     assert cfg.retry_min_s == 10
     assert cfg.retry_max_s == 10
 
 
 def test_retry_min_s_wrong_file_type_raises(tmp_path):
-    path = _write(tmp_path, {"retry_min_s": "five"})
+    path = _write(
+        tmp_path, {"backends": [{"name": "b1", "host": "h1", "port": 8000}], "retry_min_s": "five"}
+    )
     with pytest.raises(ConfigError, match="retry_min_s"):
         load_config(path=path, env={})
 
 
 def test_retry_max_s_bool_file_type_raises(tmp_path):
-    path = _write(tmp_path, {"retry_max_s": True})
+    path = _write(
+        tmp_path, {"backends": [{"name": "b1", "host": "h1", "port": 8000}], "retry_max_s": True}
+    )
     with pytest.raises(ConfigError, match="retry_max_s"):
         load_config(path=path, env={})
 
 
 def test_target_kv_cache_pct_wrong_file_type_raises(tmp_path):
-    path = _write(tmp_path, {"target_kv_cache_pct": "85"})
+    path = _write(
+        tmp_path,
+        {"backends": [{"name": "b1", "host": "h1", "port": 8000}], "target_kv_cache_pct": "85"},
+    )
     with pytest.raises(ConfigError, match="target_kv_cache_pct"):
         load_config(path=path, env={})
 
 
 def test_token_margin_wrong_file_type_raises(tmp_path):
-    path = _write(tmp_path, {"token_margin": True})
+    path = _write(
+        tmp_path, {"backends": [{"name": "b1", "host": "h1", "port": 8000}], "token_margin": True}
+    )
     with pytest.raises(ConfigError, match="token_margin"):
         load_config(path=path, env={})
 
 
 def test_bad_float_env_raises():
     with pytest.raises(ConfigError, match="TARGET_KV_CACHE_PCT"):
-        load_config(path=None, env={"TARGET_KV_CACHE_PCT": "not-a-number"})
+        load_config(
+            path=None,
+            env={
+                "TARGET_KV_CACHE_PCT": "not-a-number",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_bad_float_env_token_margin_raises():
     with pytest.raises(ConfigError, match="TOKEN_MARGIN"):
-        load_config(path=None, env={"TOKEN_MARGIN": "abc"})
+        load_config(
+            path=None,
+            env={
+                "TOKEN_MARGIN": "abc",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_bad_int_env_retry_raises():
     with pytest.raises(ConfigError, match="RETRY_MIN_S"):
-        load_config(path=None, env={"RETRY_MIN_S": "abc"})
+        load_config(
+            path=None,
+            env={
+                "RETRY_MIN_S": "abc",
+                "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+            },
+        )
 
 
 def test_thresholds_still_validated_when_present():
@@ -531,6 +707,7 @@ def test_thresholds_still_validated_when_present():
     env = {
         "THRESHOLDS_JSON": json.dumps([{"kv_pct": 50, "max_context": 4096, "timeout_s": 15}]),
         "TARGET_KV_CACHE_PCT": "60",
+        "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
     }
     cfg = load_config(path=None, env=env)
     assert cfg.thresholds == (Threshold(kv_pct=50.0, max_context=4096, timeout_s=15),)
@@ -580,9 +757,10 @@ def test_backends_from_yaml(tmp_path):
     )
 
 
-def test_backends_default_empty_tuple():
-    cfg = load_config(path=None, env={})
-    assert cfg.backends == ()
+def test_backends_required_when_absent():
+    """backends is required (decision 6): no file, no BACKENDS_JSON -> error."""
+    with pytest.raises(ConfigError, match="at least one backend is required"):
+        load_config(path=None, env={})
 
 
 def test_backends_json_env_wins_over_file(tmp_path):
@@ -635,36 +813,30 @@ def test_backends_omitted_knobs_are_none():
     assert b.default is False
 
 
-def test_backends_legacy_config_unchanged(tmp_config_file):
-    """A legacy config with no backends key parses exactly as before."""
+def test_backends_from_file_parse(tmp_config_file):
+    """The sample file's single backends entry parses (decision 6)."""
     cfg = load_config(path=tmp_config_file, env={})
-    assert cfg.backends == ()
-    assert cfg.vllm_host == "vllm"
-    assert cfg.vllm_port == 9000
+    assert cfg.backends == (Backend(name="vllm", host="vllm", port=9000, default=True),)
     assert cfg.model_refresh_interval_s == 30.0
 
 
-def test_backends_and_legacy_keys_coexist(tmp_path):
-    """vllm_host/vllm_port remain valid alongside backends (removal is later)."""
+def test_model_refresh_interval_s_from_file_and_env(tmp_path):
     path = _write(
         tmp_path,
         {
-            "vllm_host": "legacy-host",
-            "vllm_port": 9999,
-            "backends": [{"name": "b1", "host": "h1", "port": 1}],
+            "backends": [{"name": "b1", "host": "h1", "port": 8000}],
+            "model_refresh_interval_s": 12.5,
         },
     )
     cfg = load_config(path=path, env={})
-    assert cfg.vllm_host == "legacy-host"
-    assert cfg.vllm_port == 9999
-    assert len(cfg.backends) == 1
-
-
-def test_model_refresh_interval_s_from_file_and_env(tmp_path):
-    path = _write(tmp_path, {"model_refresh_interval_s": 12.5})
-    cfg = load_config(path=path, env={})
     assert cfg.model_refresh_interval_s == 12.5
-    cfg = load_config(path=None, env={"MODEL_REFRESH_INTERVAL_S": "45.5"})
+    cfg = load_config(
+        path=None,
+        env={
+            "MODEL_REFRESH_INTERVAL_S": "45.5",
+            "BACKENDS_JSON": json.dumps([{"name": "b1", "host": "h1", "port": 8000}]),
+        },
+    )
     assert cfg.model_refresh_interval_s == 45.5
 
 
