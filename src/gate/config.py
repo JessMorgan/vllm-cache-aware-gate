@@ -14,6 +14,12 @@ knobs; ``None`` means "use the global default". The legacy
 ``vllm_host``/``vllm_port`` keys and the ``VLLM_HOST``/``VLLM_PORT`` env
 vars are **removed**: a config containing them fails with an unknown-key
 :class:`ConfigError` naming the migration to ``backends:``.
+
+An optional top-level ``routing:`` section (decision 9/15) maps model id
+to a routing spec (``policy``, ``order``, and ``threshold_tokens`` for
+``large_small``); omitted or ``{}`` is valid. Model ids may be duplicated
+across backends (decision 11) — the ``routing:`` section decides which
+backend gets a request. ``routing`` is file-only (no env override).
 """
 
 from __future__ import annotations
@@ -26,6 +32,8 @@ from dataclasses import dataclass, replace
 from typing import Any, TypeGuard
 
 import yaml
+
+from gate.routing import POLICIES, RoutingSpec
 
 DEFAULT_CONFIG_PATH = "/etc/gate/config.yaml"
 
@@ -48,6 +56,7 @@ _KNOWN_KEYS: frozenset[str] = frozenset(
         "token_margin",
         "backends",
         "model_refresh_interval_s",
+        "routing",
     }
 )
 
@@ -68,6 +77,9 @@ _BACKEND_KEYS: frozenset[str] = frozenset(
         "retry_max_s",
     }
 )
+
+# Known keys inside one ``routing:`` entry.
+_ROUTING_KEYS: frozenset[str] = frozenset({"policy", "order", "threshold_tokens"})
 
 
 class ConfigError(ValueError):
@@ -110,12 +122,28 @@ class Backend:
 
 
 @dataclass(frozen=True)
+class RoutingEntry:
+    """One ``routing:`` entry: the routing spec for a single model id.
+
+    ``model`` is the model id the entry applies to; ``spec`` is the parsed
+    routing spec (policy, candidate order, and the ``large_small``
+    threshold). Parsed by :func:`_parse_routing`; the ``order`` names are
+    validated against the configured backends in :func:`_validate_routing`.
+    """
+
+    model: str
+    spec: RoutingSpec
+
+
+@dataclass(frozen=True)
 class GateConfig:
     """Fully validated gate configuration.
 
     ``backends`` is the REQUIRED upstream list (decision 6): the gate has no
     other way to learn its upstream, so an empty ``backends`` tuple is a
-    validation error, not a valid zero-config state.
+    validation error, not a valid zero-config state. ``routing`` is the
+    OPTIONAL per-model routing section (decision 9/15): an empty tuple means
+    no multi-candidate routing is configured.
     """
 
     listen_host: str = "0.0.0.0"
@@ -131,6 +159,7 @@ class GateConfig:
     retry_max_s: int = 60
     token_margin: float = 1.25
     backends: tuple[Backend, ...] = ()
+    routing: tuple[RoutingEntry, ...] = ()
 
 
 def _is_int(value: Any) -> TypeGuard[int]:
@@ -252,6 +281,87 @@ def _parse_backends(raw: Any, source: str) -> list[Backend]:
     return [_parse_backend_entry(entry, source, i) for i, entry in enumerate(raw)]
 
 
+def _parse_routing(raw: Any, source: str) -> list[RoutingEntry]:
+    """Parse a ``routing`` value (mapping of model id to entry).
+
+    The mapping keys are model ids and must be non-empty strings (YAML keys
+    can be non-string). Each entry is a mapping with ``policy`` (required,
+    one of the five policy names) and ``order`` (required, non-empty list of
+    non-empty strings, no duplicates) plus ``threshold_tokens`` (integer
+    >= 1), which must be present iff ``policy`` is ``large_small``. The
+    ``order`` names are validated against the configured backends in
+    :func:`_validate_routing`.
+
+    .. note:: KNOWN DEVIATION from decision 15's "two entries for the same
+        model => ConfigError" clause. ``yaml.safe_load`` cannot detect
+        duplicate mapping keys: it silently keeps the LAST one. So a file
+        with two entries for the same model id loads cleanly as the last
+        entry's spec — no error, no visibility. The "at most one entry per
+        model" rule therefore holds in practice via last-wins, not via a
+        :class:`ConfigError`. This is safe in outcome (last-wins still
+        yields a single well-formed entry, never a fail-open), and
+        detecting duplicates would require a custom loader / raw-text
+        pre-parse, which is out of scope.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{source}: 'routing' must be a mapping of model id to entry")
+    parsed: list[RoutingEntry] = []
+    for model, entry in raw.items():
+        if not isinstance(model, str) or not model:
+            raise ConfigError(
+                f"{source}: routing model id must be a non-empty string, got {model!r}"
+            )
+        where = f"{source}: routing[{model!r}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: entry must be an object")
+        unknown = set(entry) - _ROUTING_KEYS
+        if unknown:
+            raise ConfigError(f"{where}: unknown routing key(s): {sorted(unknown)}")
+        policy = entry.get("policy")
+        if not isinstance(policy, str):
+            raise ConfigError(f"{where}: 'policy' is required and must be a string")
+        if policy not in POLICIES:
+            raise ConfigError(
+                f"{where}: unknown routing policy {policy!r}; valid policies: {sorted(POLICIES)}"
+            )
+        if "order" not in entry:
+            raise ConfigError(f"{where}: 'order' is required")
+        order_raw = entry["order"]
+        if not isinstance(order_raw, list) or not order_raw:
+            raise ConfigError(f"{where}: 'order' must be a non-empty list of backend names")
+        seen: set[str] = set()
+        for i, name in enumerate(order_raw):
+            if not isinstance(name, str) or not name:
+                raise ConfigError(f"{where}: order[{i}] must be a non-empty string")
+            if name in seen:
+                raise ConfigError(f"{where}: duplicate backend name {name!r} in 'order'")
+            seen.add(name)
+        threshold_tokens: int | None = None
+        if "threshold_tokens" in entry:
+            raw_threshold = entry["threshold_tokens"]
+            if not _is_int(raw_threshold) or raw_threshold < 1:
+                raise ConfigError(f"{where}: 'threshold_tokens' must be an integer >= 1")
+            threshold_tokens = raw_threshold
+        if (policy == "large_small") != (threshold_tokens is not None):
+            if threshold_tokens is not None:
+                raise ConfigError(
+                    f"{where}: 'threshold_tokens' is only valid for the "
+                    f"'large_small' policy (got policy {policy!r})"
+                )
+            raise ConfigError(
+                f"{where}: 'threshold_tokens' is required for the 'large_small' policy"
+            )
+        parsed.append(
+            RoutingEntry(
+                model=model,
+                spec=RoutingSpec(
+                    policy=policy, order=tuple(order_raw), threshold_tokens=threshold_tokens
+                ),
+            )
+        )
+    return parsed
+
+
 def _load_file(path: str) -> dict[str, Any]:
     """Read and parse a YAML config file; raise ConfigError on any problem."""
     if not os.path.isfile(path):
@@ -306,6 +416,10 @@ def _merge_file(data: GateConfig, raw: dict[str, Any], source: str) -> GateConfi
         updates["thresholds"] = tuple(_parse_thresholds(raw["thresholds"], source))
     if "backends" in raw:
         updates["backends"] = tuple(_parse_backends(raw["backends"], source))
+    if "routing" in raw:
+        # File-only: there is deliberately no env override for ``routing``
+        # (the plan defines only BACKENDS_JSON/THRESHOLDS_JSON/knob env vars).
+        updates["routing"] = tuple(_parse_routing(raw["routing"], source))
     for key in ("retry_min_s", "retry_max_s"):
         if key in raw:
             if not _is_int(raw[key]):
@@ -437,6 +551,7 @@ def _validate(data: GateConfig) -> None:
     if not math.isfinite(data.token_margin) or data.token_margin < 1.0:
         raise ConfigError(f"token_margin must be a finite number >= 1.0, got {data.token_margin}")
     _validate_backends(data)
+    _validate_routing(data)
 
 
 def _validate_backends(data: GateConfig) -> None:
@@ -444,17 +559,18 @@ def _validate_backends(data: GateConfig) -> None:
 
     ``backends`` must be non-empty (decision 6): the gate has no other way
     to learn its upstream, so an empty list is a startup error. When
-    present: names are unique and non-empty, ports are in 1-65535, model ids
-    are globally unique across backends, at most one backend is
-    ``default: true``, and each per-backend knob, when present, satisfies the
-    same ranges as the global default.
+    present: names are unique and non-empty, ports are in 1-65535, at most
+    one backend is ``default: true``, and each per-backend knob, when
+    present, satisfies the same ranges as the global default. Model ids MAY
+    be duplicated across backends (decision 11): a duplicate is the normal
+    multi-candidate case, and the ``routing:`` section decides which backend
+    gets a request.
     """
     if not data.backends:
         raise ConfigError(
             "at least one backend is required (file key 'backends' or the BACKENDS_JSON env var)"
         )
     seen_names: set[str] = set()
-    seen_models: dict[str, str] = {}  # model id -> backend name
     defaults = 0
     for i, b in enumerate(data.backends):
         where = f"backends[{i}] ({b.name})"
@@ -465,13 +581,6 @@ def _validate_backends(data: GateConfig) -> None:
         seen_names.add(b.name)
         if not 1 <= b.port <= 65535:
             raise ConfigError(f"{where}: port must be in [1, 65535], got {b.port}")
-        for m in b.models:
-            if m in seen_models:
-                raise ConfigError(
-                    f"{where}: model id {m!r} is already owned by backend "
-                    f"{seen_models[m]!r}; model ids must be unique across backends"
-                )
-            seen_models[m] = b.name
         if b.default:
             defaults += 1
         if b.thresholds is not None:
@@ -513,6 +622,25 @@ def _validate_backends(data: GateConfig) -> None:
             )
     if defaults > 1:
         raise ConfigError(f"at most one backend may have 'default: true', got {defaults}")
+
+
+def _validate_routing(data: GateConfig) -> None:
+    """Validate the OPTIONAL ``routing:`` section (decision 15).
+
+    Every name in every entry's ``order`` must be a configured backend name.
+    The "order ⊆ the model's serving backends" check is deliberately NOT done
+    here: it is a startup-time, logged (not fatal) check against the
+    discovered model sets, not a config-time one.
+    """
+    backend_names = {b.name for b in data.backends}
+    for entry in data.routing:
+        where = f"routing[{entry.model!r}]"
+        for name in entry.spec.order:
+            if name not in backend_names:
+                raise ConfigError(
+                    f"{where}: order names unknown backend {name!r}; "
+                    f"configured backends: {sorted(backend_names)}"
+                )
 
 
 def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -> GateConfig:

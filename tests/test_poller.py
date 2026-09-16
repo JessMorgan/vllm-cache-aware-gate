@@ -333,6 +333,349 @@ async def test_legacy_call_without_counter_updates_caches_only() -> None:
 
 
 # ---------------------------------------------------------------------------
+# on_reanchor callback
+# ---------------------------------------------------------------------------
+
+
+async def test_on_reanchor_fires_once_per_reanchoring_tick() -> None:
+    """A good poll (usage + capacity) fires the callback exactly once per tick."""
+    metrics_calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal metrics_calls
+        metrics_calls += 1
+        return httpx.Response(200, text=METRICS_BOTH)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        counter = KvRemaining()
+        reanchor_calls = 0
+
+        def on_reanchor() -> None:
+            nonlocal reanchor_calls
+            reanchor_calls += 1
+
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                counter=counter,
+                target_frac=0.85,
+                on_reanchor=on_reanchor,
+            )
+        )
+        await asyncio.sleep(0.05)  # several good ticks
+        assert metrics_calls >= 3  # the loop actually ticked
+        assert reanchor_calls == metrics_calls  # exactly one callback per reanchor
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_reanchor_not_fired_without_capacity() -> None:
+    """A poll with usage but no capacity does not reanchor: no callback."""
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, text=METRICS_055))
+    async with httpx.AsyncClient(transport=transport) as client:
+        counter = KvRemaining()
+        reanchor_calls = 0
+
+        def on_reanchor() -> None:
+            nonlocal reanchor_calls
+            reanchor_calls += 1
+
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                counter=counter,
+                target_frac=0.85,
+                on_reanchor=on_reanchor,
+            )
+        )
+        await asyncio.sleep(0.05)  # several capacity-missing ticks
+        assert reanchor_calls == 0
+        assert counter.value() is None  # never anchored
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_reanchor_not_fired_on_transport_error() -> None:
+    """A transport-error tick does not reanchor: no callback."""
+    counter = KvRemaining()
+    counter.reanchor(1000)
+    reanchor_calls = 0
+
+    def on_reanchor() -> None:
+        nonlocal reanchor_calls
+        reanchor_calls += 1
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=_req)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                counter=counter,
+                target_frac=0.85,
+                on_reanchor=on_reanchor,
+            )
+        )
+        await asyncio.sleep(0.05)  # several failed ticks
+        assert reanchor_calls == 0
+        assert counter.value() == 1000  # last anchor persists
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_reanchor_fires_synchronously_with_reanchor() -> None:
+    """At the moment the callback runs, the counter is already re-anchored.
+
+    The callback records ``counter.value()``; every recorded value must equal
+    the freshly anchored value — proving no await (and no re-entrant tick)
+    separates the re-anchor from the callback.
+    """
+    capacity = 100000
+    target_frac = 0.85
+    usage = 0.55
+    expected = anchor_remaining_tokens(capacity, target_frac, usage)
+
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, text=METRICS_BOTH))
+    async with httpx.AsyncClient(transport=transport) as client:
+        counter = KvRemaining()
+        observed: list[int | None] = []
+
+        def on_reanchor() -> None:
+            observed.append(counter.value())
+
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                counter=counter,
+                target_frac=target_frac,
+                on_reanchor=on_reanchor,
+            )
+        )
+        await asyncio.sleep(0.05)  # several re-anchoring ticks
+        assert len(observed) >= 3
+        assert all(v == expected for v in observed)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+# ---------------------------------------------------------------------------
+# routing order ⊆ serving check
+# ---------------------------------------------------------------------------
+
+
+async def test_routing_order_dead_candidate_warns_once_and_keeps_running(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A backend named in a model's order but NOT serving it (dead candidate) warns once.
+
+    The warning fires on the first successful discovery tick, does NOT repeat
+    on later ticks, and is not fatal: the poller keeps running and syncing.
+    """
+    # "b" serves only m2; m1's order names "b" but "b" does not serve m1.
+    transport = _routing_transport(METRICS_BOTH, _models_body("m2"))
+    async with httpx.AsyncClient(transport=transport) as client:
+        registry = ModelRegistry()
+        registry.register_backend("b", is_default=True)
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                model_url="http://x/v1/models",
+                model_refresh_s=0.05,  # several discovery ticks over the window
+                registry=registry,
+                backend_name="b",
+                routing_order={"m1": ("b", "other")},  # dead candidate for m1
+            )
+        )
+        with caplog.at_level("WARNING", logger="gate.poller"):
+            await asyncio.sleep(0.05)  # first discovery tick
+            violations = [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "routing entry for model" in r.getMessage()
+            ]
+            assert len(violations) == 1
+            assert "m1" in violations[0].getMessage()
+            assert "b" in violations[0].getMessage()
+            assert "dead candidate" in violations[0].getMessage()
+            # The poller kept running: discovery synced the map...
+            assert registry.resolve("m2") == "b"
+            assert registry.resolve("m1") is None  # "b" does not serve m1
+            # ...and a second discovery tick does NOT re-log the same pair.
+            caplog.clear()
+            await asyncio.sleep(0.1)  # at least one more discovery tick
+            assert not [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "routing entry for model" in r.getMessage()
+            ]
+            assert not task.done()  # still running (logged, not fatal)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_routing_order_dead_candidate_applies_to_explicit_models(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With explicit ``models``, the owned set is the explicit list — same check."""
+    transport = _routing_transport(METRICS_BOTH, _models_body("discovered1"))
+    async with httpx.AsyncClient(transport=transport) as client:
+        registry = ModelRegistry()
+        registry.register_backend("b", is_default=True)
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                model_url="http://x/v1/models",
+                model_refresh_s=30.0,
+                registry=registry,
+                backend_name="b",
+                explicit_models=("explicit1",),  # owned set = {explicit1}
+                routing_order={"ghost": ("b",)},  # "b" named for "ghost" but does not serve it
+            )
+        )
+        with caplog.at_level("WARNING", logger="gate.poller"):
+            await asyncio.sleep(0.05)
+            violations = [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "routing entry for model" in r.getMessage()
+            ]
+            assert len(violations) == 1
+            assert "ghost" in violations[0].getMessage()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_routing_order_serving_backend_in_order_warns_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A backend that serves a model and is in its order: no warning."""
+    transport = _routing_transport(METRICS_BOTH, _models_body("m1", "m2"))
+    async with httpx.AsyncClient(transport=transport) as client:
+        registry = ModelRegistry()
+        registry.register_backend("b", is_default=True)
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                model_url="http://x/v1/models",
+                model_refresh_s=0.05,
+                registry=registry,
+                backend_name="b",
+                routing_order={"m1": ("b", "other")},  # "b" serves m1 and is in the order
+            )
+        )
+        with caplog.at_level("WARNING", logger="gate.poller"):
+            await asyncio.sleep(0.1)  # several discovery ticks
+            assert not [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "routing entry for model" in r.getMessage()
+            ]
+            assert registry.resolve("m1") == "b"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_routing_order_serving_backend_scoped_out_warns_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A serving backend deliberately scoped OUT of a model's order: no warning.
+
+    The order defines the candidate set; a serving backend absent from the
+    order is a deliberate scoping choice, not a violation.
+    """
+    transport = _routing_transport(METRICS_BOTH, _models_body("m1", "m2"))
+    async with httpx.AsyncClient(transport=transport) as client:
+        registry = ModelRegistry()
+        registry.register_backend("b", is_default=True)
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                model_url="http://x/v1/models",
+                model_refresh_s=0.05,
+                registry=registry,
+                backend_name="b",
+                routing_order={"m1": ("other",)},  # "b" serves m1 but is not in the order
+            )
+        )
+        with caplog.at_level("WARNING", logger="gate.poller"):
+            await asyncio.sleep(0.1)  # several discovery ticks
+            assert not [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "routing entry for model" in r.getMessage()
+            ]
+            assert registry.resolve("m1") == "b"  # still serves it
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_routing_order_none_is_default_no_check(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With ``routing_order`` unset (default), no check runs and no warnings appear."""
+    transport = _routing_transport(METRICS_BOTH, _models_body("m1", "m2"))
+    async with httpx.AsyncClient(transport=transport) as client:
+        registry = ModelRegistry()
+        registry.register_backend("b", is_default=True)
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                model_url="http://x/v1/models",
+                model_refresh_s=0.05,
+                registry=registry,
+                backend_name="b",
+            )
+        )
+        with caplog.at_level("WARNING", logger="gate.poller"):
+            await asyncio.sleep(0.1)
+            assert not [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "routing entry for model" in r.getMessage()
+            ]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+# ---------------------------------------------------------------------------
 # fetch_models
 # ---------------------------------------------------------------------------
 

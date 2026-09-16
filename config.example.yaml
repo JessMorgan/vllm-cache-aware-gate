@@ -13,11 +13,16 @@
 # are REMOVED: a config containing them fails with a migration-hint error.
 
 # Backends — REQUIRED (env override: BACKENDS_JSON, a JSON list; env wins and
-# replaces this list entirely). Each entry needs a unique non-empty `name`, a
-# `host`, and a `port`. `models:` is OPTIONAL — the served model ids (as
-# exposed by the backend's /v1/models, which also labels its
-# vllm:kv_cache_usage_perc series). Omit (or leave empty) to auto-adopt
-# whatever the backend serves. Model ids must be unique across ALL backends.
+# replaces this list entirely). Each entry needs a unique non-empty `name`
+# (your mnemonic — use it to know which model you are configuring), a `host`,
+# and a `port`. `models:` is OPTIONAL — the served model ids (as exposed by
+# the backend's /v1/models, which also labels its vllm:kv_cache_usage_perc
+# series). Omit (or leave empty) to auto-adopt whatever the backend serves;
+# when present and non-empty it WINS over discovery.
+# A model id MAY be listed by more than one backend (duplicate model ids are
+# LEGAL — the `routing:` section below decides which one gets a request;
+# without a routing entry, a multi-owner model defaults to round_robin).
+# Only duplicate ids WITHIN one backend's `models:` list are an error.
 # At most one backend may be `default: true` (the fallback for unknown
 # models; the first backend when none is flagged). All per-backend knobs are
 # optional and default to the global values below.
@@ -25,7 +30,7 @@ backends:
   - name: qwen
     host: vllm-qwen
     port: 8000
-    models: [qwen3-32b]      # mnemonic + validation anchor (optional)
+    models: [qwen3-32b]        # mnemonic + validation anchor (optional)
     default: true
     # Per-backend overrides (all optional — the globals below are the
     # defaults; an omitted key inherits the global value):
@@ -37,10 +42,49 @@ backends:
     # token_margin: 1.5
     # retry_min_s: 10
     # retry_max_s: 120
+  - name: qwen-fast
+    host: vllm-qwen-fast
+    port: 8001
+    models: [qwen3-32b]        # same model id as 'qwen' above (legal)
+    target_kv_cache_pct: 70.0  # fill it less: smaller effective KV headroom
   - name: llama
     host: vllm-llama
-    port: 8001
+    port: 8002
     # no models: => auto-adopt from /v1/models; no overrides => global policy
+
+# Routing — OPTIONAL. Only needed for model ids served by 2+ backends;
+# file-only (there is no env override — BACKENDS_JSON/THRESHOLDS_JSON and the
+# knob env vars are unchanged). Omitted or {} is valid. order is BOTH the
+# candidate order and the failover order (first entry tried first; on a
+# pre-stream transport failure / 5xx / 429 the next candidate is tried). A
+# backend named in order that does not serve the model is a dead candidate
+# the walk skips (each poller warns once per (model, backend) pair — logged,
+# not fatal). policy is one of:
+#   round_robin      — cycle candidates evenly (stateful, per model).
+#   primary_fallback — always prefer order[0]; fall back in order.
+#   large_small      — ctx >= threshold_tokens -> order[0] ("large"),
+#                      otherwise the remaining candidates in order.
+#   even             — route to the candidate that keeps all candidates'
+#                      projected KV-cache % closest together (spread
+#                      minimization — NOT greedy least-loaded).
+#   fill             — fill order[0] up to its target_kv_cache_pct, then
+#                      order[1], ...; 429 when every candidate is full.
+#                      (≈ primary_fallback on outcomes — see README.)
+# threshold_tokens (integer >= 1) is REQUIRED iff policy is large_small.
+# A model with multiple owners and NO entry here defaults to round_robin
+# over its candidates in config order.
+routing:
+  qwen3-32b:
+    policy: fill
+    order: [qwen, qwen-fast]
+  # Alternative shapes (commented):
+  # some-model:
+  #   policy: large_small
+  #   order: [big-box, small-box]
+  #   threshold_tokens: 8000   # required for large_small only
+  # other-model:
+  #   policy: even
+  #   order: [a, b, c]
 
 # Where the gate listens.
 # (env overrides: LISTEN_HOST, LISTEN_PORT)

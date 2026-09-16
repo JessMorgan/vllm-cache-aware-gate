@@ -287,12 +287,15 @@ class KvRemaining:
     Re-anchored by the poller on every successful observed poll (reset to the
     real-derived value) and decremented by the estimated size of each
     forwarded request. Subtraction is **not clamped** — the value may go
-    negative (an over-committed signal).
+    negative (an over-committed signal). :meth:`add` is the inverse of
+    :meth:`subtract`: the app re-adds a charge when a pre-stream failover
+    rolls back a forwarded-but-failed request's charge.
 
     Single-asyncio-loop contract: only the poller reanchors and request
-    handlers subtract; the read-modify-write is synchronous with no ``await``
-    between the read and the write, so no locking is needed — the same
-    contract as :class:`MetricsCache`.
+    handlers subtract (or re-add on a failover charge rollback); the
+    read-modify-write is synchronous with no ``await`` between the read and
+    the write, so no locking is needed — the same contract as
+    :class:`MetricsCache`.
     """
 
     def __init__(self) -> None:
@@ -320,6 +323,16 @@ class KvRemaining:
         """
         if self._value is not None:
             self._value -= tokens
+
+    def add(self, tokens: int) -> None:
+        """Re-add ``tokens`` to the estimate (app, failover charge rollback after a
+        pre-stream transport failure).
+
+        No-op when never anchored (``None``). Same single-asyncio-loop
+        contract as :meth:`subtract`.
+        """
+        if self._value is not None:
+            self._value += tokens
 
     def value(self) -> int | None:
         """Current estimate, or ``None`` if never anchored."""

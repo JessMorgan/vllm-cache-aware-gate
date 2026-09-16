@@ -13,14 +13,21 @@ Invariants (see docs/plans/multi-backend.md §2.2):
 - :class:`ModelRegistry` has the same single-asyncio-loop contract as
   :class:`gate.metrics.MetricsCache`: only the poller tasks write
   (:meth:`ModelRegistry.sync`) and request handlers read
-  (:meth:`ModelRegistry.resolve`); every read-modify-write is synchronous
-  with no ``await`` between the read and the write, so no locking is needed.
-- A model owned by two backends (only reachable via auto-adopt — explicit
-  duplicates are a config error) resolves to the ``default: true`` backend if
-  any owner is the default, else to the first-registered owner; the conflict
-  is logged once per (model, backend) pair, not on every repeated sync.
-- A model no longer owned by any backend stops resolving (``None``); requests
-  for it take the unknown-model path (default backend), never a hard 404.
+  (:meth:`ModelRegistry.resolve_candidates`); every read-modify-write is
+  synchronous with no ``await`` between the read and the write, so no
+  locking is needed.
+- **Duplicate model ids are legal** (decision 11): a model owned by 2+
+  backends is the normal multi-candidate case, not a collision.
+  :meth:`ModelRegistry.resolve_candidates` is the v2 routing lookup used by
+  the failover walk — it returns ALL owners in registration (config) order.
+- :meth:`ModelRegistry.resolve` is retained (the current app path) and
+  returns the collision winner (the ``default: true`` backend if any
+  owner is the default, else the first-registered owner) for multi-owner
+  models; the conflict is logged once per (model, backend) pair, not on
+  every repeated sync.
+- A model no longer owned by any backend stops resolving (``None`` / empty
+  tuple); requests for it take the unknown-model path (default backend),
+  never a hard 404.
 """
 
 from __future__ import annotations
@@ -67,10 +74,17 @@ class ModelRegistry:
     read-modify-write, no ``await`` inside, no locks.
 
     Backends are registered once at app build (:meth:`register_backend`, in
-    config order — registration order is the tie-break for collisions). Each
-    backend's owned set is reconciled with :meth:`sync` (explicit ``models``
-    if configured, else the discovered served set). :meth:`resolve` is the
-    routing lookup; ``None`` means the model is owned by no backend.
+    config order — registration order is the candidate order and the
+    tie-break for the collision policy). Each backend's owned set is
+    reconciled with :meth:`sync` (explicit ``models`` if configured, else the
+    discovered served set).
+
+    Duplicate model ids are legal (decision 11): :meth:`resolve_candidates`
+    is the routing lookup used by the v2 failover walk and returns ALL
+    owners in registration (config) order. :meth:`resolve` is retained until
+    the app switches over; for a multi-owner model it returns the collision
+    winner (default-wins), and the conflict is logged once per
+    (model, backend) pair.
     """
 
     def __init__(self) -> None:
@@ -113,11 +127,27 @@ class ModelRegistry:
             self._resolve_model(model)
 
     def resolve(self, model: str) -> str | None:
-        """Resolve a model id to a backend name; ``None`` when unowned."""
+        """Resolve a model id to a backend name; ``None`` when unowned.
+
+        Retained as the current app path. For a model owned by 2+
+        backends (legal — decision 11) returns the collision winner
+        (default-wins); use :meth:`resolve_candidates` for the full
+        candidate set.
+        """
         owners = self._owners(model)
         if not owners:
             return None
         return self._winner(model, owners)
+
+    def resolve_candidates(self, model: str) -> tuple[str, ...]:
+        """Return the ordered backend-name tuple serving ``model``.
+
+        The v2 routing lookup (decision 11): duplicates are the normal
+        multi-candidate case, not a collision. A single-owner model returns
+        a 1-tuple; a multi-owner model returns ALL owners in registration
+        (config) order; an unowned model returns ``()``.
+        """
+        return tuple(self._owners(model))
 
     def items(self) -> list[tuple[str, str]]:
         """Enumerate every owned model as ``(model, resolved_backend)``.

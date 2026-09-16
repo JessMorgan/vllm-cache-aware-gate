@@ -592,3 +592,29 @@ class TestKvRemaining:
         counter.subtract(25000)
         counter.reanchor(10000)
         assert counter.value() == 10000
+
+    def test_add_increments_value(self) -> None:
+        counter = KvRemaining()
+        counter.reanchor(100)
+        counter.add(25)
+        assert counter.value() == 125
+
+    def test_add_when_none_is_noop(self) -> None:
+        counter = KvRemaining()
+        counter.add(25)
+        assert counter.value() is None
+
+    def test_add_subtract_round_trip(self) -> None:
+        counter = KvRemaining()
+        counter.reanchor(100)
+        counter.subtract(30)
+        counter.add(30)
+        assert counter.value() == 100
+
+    def test_add_on_negative_value(self) -> None:
+        counter = KvRemaining()
+        counter.reanchor(10)
+        counter.subtract(50)
+        assert counter.value() == -40
+        counter.add(50)
+        assert counter.value() == 10
