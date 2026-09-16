@@ -27,8 +27,8 @@ asserting the accurate position after pushback, while making clear the
 decision is the user's. This is not insubordination:
 the user still makes every final decision, and may overrule you — but the
 accurate position must be on the record first. (The Git-management
-distinct-model review and attribution gates are concrete applications of this
-section.)
+`qwen` + `gemma` review and attribution gates are concrete applications of
+this section.)
 
 ## Project map
 
@@ -230,16 +230,18 @@ architecture sections, or with non-obvious interdependencies:
 4. **One commit per segment or sub-segment.** Each segment of the feature — or
    of a subset — gets its own commit. Even when a feature focuses on one
    thing, if the plan splits it by architecture section (e.g. config →
-   decision → proxy), the commits are split the same way. The Git-management
-   gates (CI checks, per-commit distinct-model review, attribution block)
-   apply to each commit individually at merge time, not to the feature as a
-   whole.
+    decision → proxy), the commits are split the same way. The Git-management
+    gates (CI checks, per-commit two-model review, attribution block)
+    apply to each commit individually at merge time, not to the feature as a
+    whole.
 5. **Keep the review pipeline honest.** Commits may be made on the branch
    before they are reviewed, but the review pipeline must not lag: review
    findings are addressed inline via history rewriting *within the unmerged
    branch only* (see rule 10), and no branch is merged to `main` or pushed
-   as a PR until **every** commit on it has its individual review and proper
-   attribution (see Git-management, steps 2–3 and 7).
+   as a PR until **every** commit on it has been reviewed by **both** `gemma`
+   and `qwen` (each commit, each reviewer — see rule 10 for running them in
+   parallel) and carries proper attribution (see Git-management, steps 2–3
+   and 7).
 6. **Merge sub-branches into the feature branch.** When a non-trivial
    sub-branch (more than one commit) is complete, merge it back with
    `git merge --no-ff` so each subset stays visible as its own merge in
@@ -262,16 +264,19 @@ architecture sections, or with non-obvious interdependencies:
    still shown as pending, is a reporting defect the same way a skipped check
    reported as run is one.
 10. **Treat a pre-merge branch as a PR stack.** A feature or sub-branch that
-   is not yet merged can consider its work as if it were a stack of PRs:
-   reviews may be batched over any number of the branch's commits (e.g.
-   review commits 2–5 together) rather than one commit at a time, and
-   feedback is addressed inline via history rewriting — amends and
-   rebases — **WITHIN THE UNMERGED BRANCH ONLY**. Never rewrite history on
-   `main` or on any branch already merged; those commits are final. Batching
-   reviews does not relax the per-commit gate (Git-management steps 2–3 and
-   7): each commit still needs its own review and attribution before merge
-   or PR creation, but that requirement may be satisfied by a batched review
-   that covers it.
+    is not yet merged can consider its work as if it were a stack of PRs:
+    **before** merging, a branch may run all of the necessary reviews for
+    all of its commits **in parallel** (running multiple reviewers
+    simultaneously against different commits) rather than serially, and
+    feedback is addressed inline via history rewriting — amends and
+    rebases — **WITHIN THE UNMERGED BRANCH ONLY**. Never rewrite history on
+    `main` or on any branch already merged; those commits are final.
+    Running reviewers in parallel is a scheduling optimization only: it does
+    **not** relax the per-commit, per-reviewer gate (Git-management steps
+    2–3 and 7) — a single review of multiple commits **never** counts as a
+    sufficient review for any of those commits. Each commit still needs its
+    **own** review **by both** `gemma` and `qwen` and its own attribution
+    before merge or PR creation.
 
 ## Git management
 
@@ -285,29 +290,36 @@ Before merging any complete change to `main`, or pushing it as a PR:
    `docker build` (skipped with a warning if docker is absent). Fix every
    issue reported by these checks, then rerun `scripts/local-ci.sh` until it
    passes, before merging the change or pushing it as a PR.
-2. **Require a code review by a distinct AI model as a mandatory gate before
+2. **Require a code review by `qwen` and `gemma` as a mandatory gate before
    merging to `main` or pushing a PR.** Before any branch is merged to
-   `main`, or pushed as a PR, obtain a review of the complete diff from a
-   model other than the one that authored the change — per commit for
-   single-commit branches, or a batched review covering multiple commits for
-   multi-commit branches (see Dev-style rule 10: a pre-merge branch is a PR
-   stack, and reviews may be batched over any number of the branch's commits,
-   with feedback addressed inline via history rewriting within the unmerged
-   branch only). Each commit **MUST** have its own review and proper
-   attribution before merge or PR creation (step 7). Do **not** merge to
-   `main` or push a PR until the required reviews have been produced.
+   `main`, or pushed as a PR, every commit on it must be reviewed —
+   individually, per commit — by **both** the `qwen` and `gemma` families.
+   A multi-commit branch may run all of those reviews **in parallel**
+   (multiple reviewers simultaneously against different commits; see
+   Dev-style rule 10: a pre-merge branch is a PR stack), with feedback
+   addressed inline via history rewriting within the unmerged branch only.
+   Running reviews in parallel is purely a scheduling optimization: a single
+   review of multiple commits **never** satisfies the per-commit requirement
+   for any of those commits. Each commit **MUST** have its own review by both
+   families (or, where a family is unavailable, its own review by the
+   remaining family — below) and proper attribution before merge or PR
+   creation (step 7). Do **not** merge to `main` or push a PR until the
+   required reviews have been produced.
 
-   **Reviewer preference: both `qwen` and `gemma`.** Prefer obtaining
-   reviews from **both** the `qwen` and `gemma` families; however, only one
-   is **necessary** when the other is being flaky — a review from the
-   available family satisfies the distinct-model requirement.
-
-   The reviewer must be a genuinely different model — routing the review to a
-   subagent category that defaults to the committer's own model is **not** a
-   valid review. The reviewing model's name must appear in the review output
-   (for example, "Review performed by `deepseek-v4-*`" or another
-   non-committer provider model) so the separation is verifiable; record that
-   name with the review findings.
+    **Required reviewers: both `qwen` and `gemma`.** Every commit requires a
+   review from **each** of the `qwen` and `gemma` families. Prefer running
+   each required review from a model **different from the authoring
+   model** (e.g. a different provider, or a distinct qwen/gemma model when
+   the author is of that family). If the preferred distinct-family review
+   fails **twice** (the reviewer flakes, times out, or produces no usable
+   verdict on both attempts), a review from the **authoring model's own
+   family** is acceptable in its place — including the authoring model
+   itself. When even that fallback is unavailable, the remaining family's
+   review alone satisfies the requirement for that commit; a single family's
+   repeated failure is not a blocker. The commit's attribution block records
+   exactly which model(s) actually produced each review (step 7), and
+   records `flake: <family>` for any required slot that ultimately had no
+   review.
 
    The review request must be adversarial and self-contained, containing at
    minimum:
@@ -336,17 +348,40 @@ Before merging any complete change to `main`, or pushing it as a PR:
      prefixed `[blocker|major|minor|nit]` with file:line references, then a
      short overall assessment.
 
-   The review must cover correctness, adherence to existing codebase patterns,
-   the CI/coverage results, and any security or regression risks.
-3. **Present the review results to the user and ask how to proceed.** Surface
-   the distinct reviewer's findings and recommendation to the user in exactly
-   this shape: a `VERDICT: APPROVE | REQUEST CHANGES | REJECT` line and a
-   `REVIEWER MODEL:` line naming the reviewing model, followed by a bulleted
-   findings list in which every bullet is prefixed with its severity
-   (`[blocker]`, `[major]`, `[minor]`, or `[nit]`); then ask the user how to
-   proceed. Options include merging or pushing as-is, revising per the
-   review, or abandoning. Do not treat a clean or critical review as an
-   automatic decision — the user's final call is definitive and cannot be
+    The review must cover correctness, adherence to existing codebase patterns,
+    the CI/coverage results, and any security or regression risks.
+
+    **Validate review feedback before acting on it.** Reviewer findings are
+    claims, not commands: before fixing anything, verify the claim against
+    the actual code (trace the cited path, run the suggested repro or the
+    affected tests, e.g. `pytest -q <affected-test-file>`). Address the
+    finding only when it checks out; invalid findings are recorded as
+    false positives and dropped (or pushed back on), never blindly applied.
+    Valid `major`-or-above findings must be addressed before the commit
+    proceeds; valid `minor`/`nit` findings are worth addressing when
+    reasonable. Reviewers differ in reliability — `gemma` in particular is
+    prone to false positives — so extra skepticism toward its findings is
+    expected, and a `REQUEST CHANGES` verdict never by itself blocks a merge
+    (step 3 governs the outcome).
+3. **Present the review results to the user and ask how to proceed.**
+   Surface **each** reviewer's findings and recommendation (both `gemma` and
+   `qwen` where both were run) to the user in exactly this shape: a
+   `VERDICT: APPROVE | REQUEST CHANGES | REJECT` line and a `REVIEWER MODEL:`
+   line naming the reviewing model, followed by a bulleted findings list in
+   which every bullet is prefixed with its severity (`[blocker]`, `[major]`,
+   `[minor]`, or `[nit]`); then ask the user how to proceed. Before
+   presenting, validate the findings against the code (see the validation
+   note in step 2) and mark which check out; valid `major`-or-above findings
+   must be addressed (and the commit amended) before presenting. When a
+   reviewer's `REQUEST CHANGES` or other findings turned out to be false
+   positives, say so explicitly — the verdict is disclosed accurately as
+   given, and the commit message clarifies that the `REQUEST CHANGES` was
+   due to false positives (step 7) rather than masking or softening the
+   verdict. A `REQUEST CHANGES` does not by itself prevent merging when its
+   findings are invalid; it does block merging while valid `major`+ findings
+   remain unaddressed. Options include merging or pushing as-is, revising
+   per the review, or abandoning. Do not treat a clean or critical review as
+   an automatic decision — the user's final call is definitive and cannot be
    overridden.
 4. Update all relevant documentation to reflect the new reality, including
    `AGENTS.md`, `README.md`, `config.example.yaml`, and any other checked-in
@@ -362,36 +397,53 @@ Before merging any complete change to `main`, or pushing it as a PR:
    message detail (the explanatory body) and prior to any footer (such as a
    `Co-Authored-By:` block), an attribution block of exactly this form:
 
-   ```
-   Written by: [model] ([agent])
-   Reviewed by: [review-model] ([review agent]) — VERDICT
-   ```
+    ```
+    Written by: [model] ([agent])
+    Reviewed by: [review-model-1] ([review agent]) — VERDICT   # one line per reviewer that actually ran
+    Reviewed by: [review-model-2] ([review agent]) — VERDICT
+    ```
 
-   One blank line separates the block from the message detail above (the
-   explanatory body when one exists, otherwise the subject line) and from any
-   footer below. `[model]` / `[review-model]` are human-readable display names,
-   e.g. `GLM-5.3 Flash` / `Beast Qwen3.8 27B`; the parenthesized agent is the
-   tool that produced the change or ran the review (e.g. `CodeBuff`, `OpenCode`,
-   `FreeBuff`) and is included on both lines whenever the agent is known.
-   `VERDICT` is the actual verdict surfaced in step 3 from the step-2 review
-   (`APPROVE`, `REQUEST CHANGES`, or `REJECT`) — the final verdict when the
-   change went through multiple review rounds.
+    One blank line separates the block from the message detail above (the
+    explanatory body when one exists, otherwise the subject line) and from any
+    footer below. `[model]` / `[review-model]` are human-readable display names,
+    e.g. `GLM-5.3 Flash` / `Beast Qwen3.8 27B`; the parenthesized agent is the
+    tool that produced the change or ran the review (e.g. `CodeBuff`, `OpenCode`,
+    `FreeBuff`) and is included on all lines whenever the agent is known.
+    The `Reviewed by:` lines — **one per reviewer, in the order the reviewers
+    ran** — name the reviews of **this commit's diff** produced for it
+    (normally one per family: `qwen` and `gemma`), and each `VERDICT` is
+    that reviewer's actual verdict surfaced in step 3 from the step-2 review
+    (`APPROVE`, `REQUEST CHANGES`, or `REJECT`) — the final verdict for that
+    reviewer when the change went through multiple review rounds. A
+    same-family review (the author's own family reviewing its own commit,
+    allowed only after step 2's distinct-family attempts failed twice) is
+    recorded exactly like any other. When a family's review ultimately could
+    not be produced (step 2's fallback), the block carries no `Reviewed by:`
+    line for that family and instead notes `flake: <family>` so the record
+    shows which required slot went unreviewed. A `REQUEST CHANGES` verdict
+    whose findings were validated as false positives is still recorded
+    verbatim; the commit message detail (or a short `Note:` line after the
+    block) clarifies that the `REQUEST CHANGES` was due to false positives,
+    so the record shows both the true verdict and the accurate outcome.
 
-   The `Reviewed by:` line is an evidence-bearing assertion, not a formality:
-   it must name the step-2 reviewer of **this commit's diff**, obtained
-   **before** the commit is merged to `main` or pushed as a PR, and the review
-   model must differ from the authoring model. A commit created before its
-   review is legitimate (see step 2 and Dev-style rules 5 and 10), but the
-   `Reviewed by:` line may only ever describe a review that has actually
-   happened: never include it on a change that has not been reviewed, never
-   reuse another diff's review, and never fill it in prospectively — if the
-   review has not happened yet, the merge or PR does not happen yet (step 2),
-   and the line is added or corrected via history rewriting within the
-   unmerged branch (Dev-style rule 10). Formatting-only or trivially
-   mechanical changes are not exempt. This is an
-   honesty-based gate: the message alone does not let a reader mechanically
-    verify the claim, so hardening beyond wording (e.g. a pre-commit hook
-    validating a review artifact) remains an option if violations recur.
+    Each `Reviewed by:` line is an evidence-bearing assertion, not a
+    formality: it must name a step-2 reviewer of **this commit's diff**,
+    obtained **before** the commit is merged to `main` or pushed as a PR.
+    Same-family reviews are permitted (step 2), but only where the distinct-
+    family preference genuinely could not be met; the line must still name a
+    real model that produced a real review of this diff. A commit created
+    before its review is legitimate (see step 2 and Dev-style rules 5 and
+    10), but a `Reviewed by:` line may only ever describe a review that has
+    actually happened: never include it on a change that has not been
+    reviewed, never reuse another diff's review, and never fill it in
+    prospectively — if the reviews have not happened yet, the merge or PR
+    does not happen yet (step 2), and the lines are added or corrected via
+    history rewriting within the unmerged branch (Dev-style rule 10).
+    Formatting-only or trivially mechanical changes are not exempt. This is
+    an honesty-based gate: the message alone does not let a reader
+    mechanically verify the claim, so hardening beyond wording (e.g. a
+    pre-commit hook validating a review artifact) remains an option if
+    violations recur.
 
 ## CI / release / local parity
 
