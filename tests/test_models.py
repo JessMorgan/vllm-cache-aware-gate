@@ -258,3 +258,76 @@ def test_items_drops_unowned_models():
     reg.sync("a", {"m1", "m2"})
     reg.sync("a", {"m1"})
     assert reg.items() == [("m1", "a")]
+
+
+# --- ModelRegistry.resolve_candidates (v2 routing lookup) ---------------------
+
+
+def test_resolve_candidates_single_owner_is_one_tuple():
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.register_backend("b", is_default=True)
+    reg.sync("a", {"m1"})
+    reg.sync("b", {"m2"})
+    assert reg.resolve_candidates("m1") == ("a",)
+    assert reg.resolve_candidates("m2") == ("b",)
+
+
+def test_resolve_candidates_multi_owner_in_registration_order():
+    """A multi-owner model returns ALL owners in registration (config) order,
+    NOT sync order."""
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.register_backend("b", is_default=False)
+    reg.register_backend("c", is_default=True)
+    # b syncs first, a second: sync order is (b, a), registration is (a, b).
+    reg.sync("b", {"m"})
+    reg.sync("a", {"m"})
+    assert reg.resolve_candidates("m") == ("a", "b")
+    # c does not own m: it must not appear.
+    reg.sync("c", {"c-only"})
+    assert reg.resolve_candidates("m") == ("a", "b")
+
+
+def test_resolve_candidates_unowned_model_is_empty_tuple():
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.sync("a", {"m1"})
+    assert reg.resolve_candidates("unknown") == ()
+
+
+def test_resolve_candidates_removed_from_all_owners_is_empty():
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.register_backend("b", is_default=True)
+    reg.sync("a", {"m"})
+    reg.sync("b", {"m"})
+    assert reg.resolve_candidates("m") == ("a", "b")
+    reg.sync("b", set())
+    assert reg.resolve_candidates("m") == ("a",)
+    reg.sync("a", set())
+    assert reg.resolve_candidates("m") == ()
+
+
+def test_resolve_candidates_grows_when_second_owner_added_on_later_sync():
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.register_backend("b", is_default=False)
+    reg.sync("a", {"m"})
+    assert reg.resolve_candidates("m") == ("a",)
+    reg.sync("b", {"m"})
+    assert reg.resolve_candidates("m") == ("a", "b")
+
+
+def test_resolve_and_resolve_candidates_coexist_for_multi_owner():
+    """For a multi-owner model, resolve returns the collision winner
+    (default-wins) while resolve_candidates returns all owners."""
+    reg = ModelRegistry()
+    reg.register_backend("a", is_default=False)
+    reg.register_backend("b", is_default=True)
+    reg.sync("a", {"m", "a-only"})
+    reg.sync("b", {"m"})
+    assert reg.resolve("m") == "b"  # default wins the collision
+    assert reg.resolve_candidates("m") == ("a", "b")  # all owners, config order
+    assert reg.resolve("a-only") == "a"
+    assert reg.resolve_candidates("a-only") == ("a",)
