@@ -50,9 +50,27 @@ purely by staleness in the app layer, never by a failed fetch. A non-200
 response is likewise non-fatal (``observed`` is ``False`` and all state is
 kept).
 
+**Engine callbacks (state-change only, logged-not-fatal):** when ``on_engine``
+is wired, it is invoked synchronously with the tick that first detects an
+engine or observes a CHANGE in the detected engine (``sample.engine`` differs
+from the last detected one — first detection included, and a change to or
+from ``unknown``); the poller keeps a local ``last_engine`` that only observed
+(HTTP 200) bodies update, so transport errors and non-200 responses never
+change it. When ``on_metrics_unavailable`` is wired, it is invoked with the
+new state whenever the *unavailable* state changes (either direction): a
+non-200 response or a 200 body detected ``unknown`` is ``True``; a 200 body
+detected ``vllm``/``sglang`` is ``False``; a pure transport error leaves the
+state unchanged. On a transition INTO unavailable the poller additionally
+logs a WARNING once (the ``--enable-metrics`` hint for SGLang); on recovery
+nothing is logged. No new process exit: both callbacks are logged-not-fatal,
+mirroring the capacity-missing and dead-candidate paths.
+
 **Capacity-missing (per-backend fail-open):** an observed (HTTP 200) body that
-lacks a usable KV-cache capacity (the ``vllm:kv_cache_size_tokens`` gauge or
-the ``kv_cache_size_tokens`` label on ``vllm:cache_config_info``) cannot
+lacks a usable KV-cache capacity (the capacity gauges of the *detected*
+engine — the ``vllm:kv_cache_size_tokens`` gauge or the
+``kv_cache_size_tokens`` label on ``vllm:cache_config_info`` for vLLM, the
+``sglang:kv_cache_total_tokens`` / ``sglang:max_total_num_tokens`` gauges for
+SGLang, "no recognizable KV-cache capacity" for an ``unknown`` body) cannot
 anchor the counter. This is NO LONGER fatal: the poller logs an error,
 **unanchors the counter** — a previously anchored counter is reset to the
 never-anchored state so the backend's autoconfig layer fails open instead of
@@ -84,6 +102,8 @@ from collections.abc import Callable
 import httpx
 
 from gate.metrics import (
+    ENGINE_SGLANG,
+    ENGINE_VLLM,
     CapacityCache,
     KvRemaining,
     MetricsCache,
@@ -107,6 +127,18 @@ async def fetch_models(client: httpx.AsyncClient, url: str) -> list[str] | None:
     if resp.status_code != 200:
         return None
     return parse_v1_models(resp.text)
+
+
+def _capacity_gauge_names(engine: str) -> str:
+    """The capacity gauge names for the detected engine (for the capacity-missing error)."""
+    if engine == ENGINE_VLLM:
+        return (
+            "the vllm:kv_cache_size_tokens gauge or the kv_cache_size_tokens label "
+            "on vllm:cache_config_info"
+        )
+    if engine == ENGINE_SGLANG:
+        return "the sglang:kv_cache_total_tokens gauge or the sglang:max_total_num_tokens gauge"
+    return "no recognizable KV-cache capacity"
 
 
 def _warn_routing_order_violations(
@@ -162,6 +194,8 @@ async def run_poller(
     explicit_models: tuple[str, ...] | None = None,
     capacity_unavailable: Callable[[], None] | None = None,
     on_reanchor: Callable[[], None] | None = None,
+    on_engine: Callable[[str], None] | None = None,
+    on_metrics_unavailable: Callable[[bool], None] | None = None,
     routing_order: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
     """Poll ``url`` every ``interval_s`` seconds, updating all wired state.
@@ -189,9 +223,41 @@ async def run_poller(
          sequence increments atomically with it.
        - ``capacity_cache`` present -> ``capacity_cache.update(
          capacity_tokens)``.
-      - A body with capacity but no usage -> no reanchor (nothing to anchor
-        against), not fatal; the last anchor persists.
-    - non-observed (non-200) -> keep all state (no-op), never fatal.
+       - A body with capacity but no usage -> no reanchor (nothing to anchor
+         against), not fatal; the last anchor persists.
+       - The capacity-missing error message is engine-aware: it names the
+         capacity gauges of the *detected* engine (``_capacity_gauge_names``)
+         — the vLLM gauges for ``vllm``, the SGLang gauges for ``sglang``,
+         and "no recognizable KV-cache capacity" for ``unknown``.
+     - non-observed (non-200) -> keep all state (no-op), never fatal.
+     - Engine callbacks (state-change only, synchronous with the tick; fire
+       for observed AND non-observed samples — the state is computed from
+       every fetch outcome that returns a sample, not just HTTP 200):
+       - ``on_engine(engine)`` fires when ``sample.engine`` differs from the
+         last detected engine (first detection, and any change — including
+         a change to or from ``unknown``); the poller keeps a local
+         ``last_engine`` that is updated only on observed bodies, so
+         transport errors and non-200 responses do not change it.
+       - ``on_metrics_unavailable(state)`` fires with the new state
+         whenever the *unavailable* state changes (either direction),
+         where the state is computed from every fetch outcome that
+         returns a sample (observed or not) as
+         ``not (observed and engine in (vllm, sglang))``: a non-200
+         response (``observed=False``) or a 200 body detected
+         ``unknown`` -> ``True``; a 200 body detected ``vllm``/``sglang``
+         -> ``False``. A pure transport error does NOT change the state
+         (the existing ``metrics fetch failed`` warning covers a downed
+         server; the outage is already visible via ``gate_metrics_fresh``).
+         On a transition INTO unavailable (``True``) a WARNING is logged
+         once (the ``--enable-metrics`` hint for SGLang); on the ``False``
+         transition nothing is logged (recovery is visible via the
+         gauges). This is what keeps the once-per-transition warning and
+         the ``gate_metrics_endpoint_unavailable`` gauge consistent for
+         the whole unavailable period, with re-degradation after recovery
+         warned again (docs/plans/sglang-backend.md decision 8). Note the
+         ``404 -> healthy-vllm`` recovery fires ``False`` even though the
+         engine never changed — it rides this state callback, not
+         ``on_engine``.
 
     When ``model_url``, ``registry``, and ``backend_name`` are all given, the
     tick also does model discovery: the first tick fetches immediately, then
@@ -228,6 +294,13 @@ async def run_poller(
     # (model, backend) pairs for which the routing-order warning already fired
     # (decision 15: log once per pair, not on every tick).
     warned_routing_order: set[tuple[str, str]] = set()
+    # Last detected engine (observed bodies only) — drives the state-change
+    # on_engine callback (first detection and any change, including to/from
+    # unknown). Transport errors and non-200 responses do not change it.
+    last_engine: str | None = None
+    # Last computed metrics-endpoint-unavailable state (None = never
+    # computed) — drives the state-change on_metrics_unavailable callback.
+    unavailable: bool | None = None
     try:
         while True:
             try:
@@ -235,15 +308,46 @@ async def run_poller(
             except httpx.HTTPError:
                 log.warning("metrics fetch failed for %s; keeping all state", url)
             else:
+                # Metrics-endpoint-unavailable state, computed from every
+                # fetch outcome that returns a sample (observed or not):
+                # True for a non-200 response (observed=False) or a 200 body
+                # detected unknown, False for a 200 body detected vllm/
+                # sglang. A pure transport error (the except branch above)
+                # never reaches here — the state is unchanged on a downed
+                # server (decision 8).
+                new_unavailable = not (
+                    sample.observed and sample.engine in (ENGINE_VLLM, ENGINE_SGLANG)
+                )
+                if new_unavailable != unavailable:
+                    if new_unavailable:
+                        log.warning(
+                            "metrics endpoint at %s returned no recognizable "
+                            "KV-cache gauge — if this is an SGLang server, "
+                            "launch it with --enable-metrics; the tiered "
+                            "layer fails open (staleness) and the autoconfig "
+                            "layer fails open (no capacity)",
+                            url,
+                        )
+                    if on_metrics_unavailable is not None:
+                        # Synchronous with the tick that observed the change;
+                        # state-change only (either direction).
+                        on_metrics_unavailable(new_unavailable)
+                    unavailable = new_unavailable
                 if sample.observed:
+                    if sample.engine != last_engine:
+                        if on_engine is not None:
+                            # Synchronous with the tick; first detection and
+                            # any change (including to/from unknown).
+                            on_engine(sample.engine)
+                        last_engine = sample.engine
                     if sample.capacity_tokens is None:
                         log.error(
-                            "autoconfig requires a usable KV-cache capacity (the "
-                            "vllm:kv_cache_size_tokens gauge or the "
-                            "kv_cache_size_tokens label on vllm:cache_config_info) "
-                            "but the observed body at %s does not provide it; the "
-                            "backend's autoconfig layer will fail open and the "
-                            "gate_backend_capacity_unavailable gauge will be set",
+                            "autoconfig requires a usable KV-cache capacity "
+                            "(%s) but the observed body at %s does not "
+                            "provide it; the backend's autoconfig layer will "
+                            "fail open and the gate_backend_capacity_unavailable "
+                            "gauge will be set",
+                            _capacity_gauge_names(sample.engine),
                             url,
                         )
                         if capacity_unavailable is not None:
