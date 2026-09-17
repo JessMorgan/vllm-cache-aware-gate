@@ -290,8 +290,17 @@ async def test_good_poll_reanchors_counter_and_updates_caches() -> None:
             await task
 
 
-async def test_capacity_without_usage_no_reanchor_no_raise() -> None:
-    """Capacity present but usage absent: no reanchor, no raise; capacity cached."""
+async def test_capacity_only_no_usage_detects_unknown_unanchors() -> None:
+    """A capacity-only body (no usage gauge) now detects as ``unknown``.
+
+    With engine auto-detection (docs/plans/sglang-backend.md decision 2), a
+    body that has a capacity gauge but no usage gauge is classified
+    ``unknown`` (detection is usage-gauge-only), so the ``UnknownMetricsParser``
+    yields ``capacity_tokens=None`` and the poller takes the capacity-missing
+    path: it unanchors the counter and leaves the capacity cache empty. This
+    is the documented "detection is usage-gauge-only" consequence (the plan's
+    Known risks) — such a backend never anchors. No raise; the loop continues.
+    """
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, text=METRICS_CAPACITY_ONLY))
     async with httpx.AsyncClient(transport=transport) as client:
         cache = MetricsCache()
@@ -310,9 +319,9 @@ async def test_capacity_without_usage_no_reanchor_no_raise() -> None:
             )
         )
         await asyncio.sleep(0.05)
-        assert counter.value() == 1000  # last anchor persists
+        assert counter.value() is None  # unanchored (capacity-missing path)
         assert cache.value() is None  # no usage to store
-        assert capacity_cache.value() == 100000
+        assert capacity_cache.value() is None  # unknown parser yields no capacity
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
