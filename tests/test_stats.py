@@ -219,6 +219,63 @@ class TestRoutingFailovers:
         )
 
 
+class TestRejections:
+    def test_increments_per_reason(self) -> None:
+        stats = make_stats()
+        stats.record_rejection("m", "b", "exceeds_tier", tier_kv_pct="80")
+        stats.record_rejection("m", "none", "all_backends_failed")
+        text = stats.render().decode()
+        # Alphabetical label order: backend, model, reason, tier_kv_pct.
+        assert (
+            'gate_rejections_total{backend="b",model="m",reason="exceeds_tier",'
+            'tier_kv_pct="80"} 1.0' in text
+        )
+        assert (
+            'gate_rejections_total{backend="none",model="m",'
+            'reason="all_backends_failed",tier_kv_pct="0"} 1.0' in text
+        )
+
+    def test_auto_exceeds_headroom_defaults_tier_kv_pct(self) -> None:
+        stats = make_stats()
+        stats.record_rejection("m", "b", "auto_exceeds_headroom")
+        text = stats.render().decode()
+        assert (
+            'gate_rejections_total{backend="b",model="m",reason="auto_exceeds_headroom",'
+            'tier_kv_pct="0"} 1.0' in text
+        )
+
+    def test_distinct_series_and_counts(self) -> None:
+        stats = make_stats()
+        stats.record_rejection("m", "b", "exceeds_tier", tier_kv_pct="80")
+        stats.record_rejection("m", "b", "exceeds_tier", tier_kv_pct="80")
+        stats.record_rejection("m", "b", "exceeds_tier", tier_kv_pct="50")
+        text = stats.render().decode()
+        assert (
+            'gate_rejections_total{backend="b",model="m",reason="exceeds_tier",'
+            'tier_kv_pct="80"} 2.0' in text
+        )
+        assert (
+            'gate_rejections_total{backend="b",model="m",reason="exceeds_tier",'
+            'tier_kv_pct="50"} 1.0' in text
+        )
+
+    def test_rejections_label_set(self) -> None:
+        stats = make_stats()
+        stats.record_rejection("m", "b", "exceeds_tier", tier_kv_pct="80")
+        for family in text_string_to_metric_families(stats.render().decode()):
+            if family.name == "gate_rejections":
+                for sample in family.samples:
+                    if sample.name == "gate_rejections_total":
+                        assert sample.labels == {
+                            "backend": "b",
+                            "model": "m",
+                            "reason": "exceeds_tier",
+                            "tier_kv_pct": "80",
+                        }
+                        return
+        raise AssertionError("gate_rejections_total sample not found in rendered output")
+
+
 class TestPerModelSeparation:
     def test_distinct_model_series(self) -> None:
         stats = make_stats()

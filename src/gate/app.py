@@ -64,8 +64,11 @@ recorded as ``forwarded`` with that backend — the gate's decision was
 **Recording (decision 13).** ``stats.record_forwarded`` /
 ``record_rejected`` carry the ``backend`` label — the final backend (the
 forwarder, the max-timeout rejector on 429 exhaustion, or the sentinel
-``"none"`` on 502 exhaustion). Each failover skip is logged (a
-``routing_failover`` line) and counted by
+``"none"`` on 502 exhaustion). ``stats.record_rejection`` additionally
+records the refusal reason (``exceeds_tier`` / ``auto_exceeds_headroom`` /
+``all_backends_failed``) in
+``gate_rejections_total{model, backend, reason, tier_kv_pct}``. Each
+failover skip is logged (a ``routing_failover`` line) and counted by
 ``gate_routing_failovers_total{model, from, to, reason}``.
 
 **Per-backend admission state.** All admission state is scoped per backend,
@@ -802,6 +805,19 @@ def create_app(
                 stats.record_rejected(endpoint, model, ctx_tokens, backend=rejector_name)
             except Exception:  # noqa: BLE001 - stats must never break the request path
                 log.warning("stats.record_rejected failed", exc_info=True)
+            try:
+                stats.record_rejection(
+                    model,
+                    rejector_name,
+                    rejector_dec.reason,
+                    tier_kv_pct=(
+                        f"{rejector_dec.active_tier.kv_pct:g}"
+                        if rejector_dec.active_tier is not None
+                        else "0"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - stats must never break the request path
+                log.warning("stats.record_rejection failed", exc_info=True)
             # The 429-exhaustion check runs before last-5xx propagation, so a
             # last-candidate pre-stream 5xx (remembered in last_upstream_5xx)
             # is NOT propagated here — it is discarded. If it was a streaming
@@ -855,6 +871,10 @@ def create_app(
             stats.record_rejected(endpoint, model, ctx_tokens, backend="none")
         except Exception:  # noqa: BLE001 - stats must never break the request path
             log.warning("stats.record_rejected failed", exc_info=True)
+        try:
+            stats.record_rejection(model, "none", "all_backends_failed")
+        except Exception:  # noqa: BLE001 - stats must never break the request path
+            log.warning("stats.record_rejection failed", exc_info=True)
         return JSONResponse(
             status_code=502,
             content={

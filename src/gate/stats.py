@@ -45,7 +45,13 @@ Invariants (see AGENTS.md "Known gotchas"):
    gauge — e.g. SGLang launched without ``--enable-metrics``); ``0`` once a
    real engine is detected. ``gate_config_info`` serializes the backend
    structure and the ``routing:`` section (``routing_json``:
-   ``[[model, policy, [order...]], ...]``, startup-static for operator audit).
+    ``[[model, policy, [order...]], ...]``, startup-static for operator audit).
+    ``gate_rejections_total{model, backend, reason, tier_kv_pct}`` counts
+    rejected requests by refusal reason (``exceeds_tier`` = the tiered
+    "max context" layer, ``auto_exceeds_headroom`` = the autoconfig headroom
+    layer, ``all_backends_failed`` = every candidate transport-failed on 502
+    exhaustion); ``tier_kv_pct`` is the governing tier's ``kv_pct``
+    percentage when the tiered layer is the rejector, else ``"0"``.
 
 - A per-app registry is required: the app creates one ``GateStats`` per
   process, and tests create many apps, so the global default registry must
@@ -122,6 +128,16 @@ class GateStats:
             "or returned a pre-stream upstream 5xx, so the walk moved to the next "
             "candidate (reason: reject | transport | upstream_5xx).",
             ["model", "from", "to", "reason"],
+            registry=self._registry,
+        )
+        self._rejections_total = Counter(
+            "gate_rejections_total",
+            "Rejected requests by the gate, by model, backend, and refusal reason "
+            "(exceeds_tier = the tiered 'max context' layer; auto_exceeds_headroom = the "
+            "autoconfig headroom layer; all_backends_failed = every candidate "
+            "transport-failed). The tier_kv_pct label is the governing tier's kv_pct "
+            "percentage when the tiered layer is the rejector, else '0'.",
+            ["model", "backend", "reason", "tier_kv_pct"],
             registry=self._registry,
         )
         self._kv_usage = Gauge(
@@ -213,6 +229,25 @@ class GateStats:
         self._requests_total.labels(endpoint, model, "rejected", backend).inc()
         if ctx_tokens is not None:
             self._ctx_tokens.labels(model, "rejected", backend).observe(ctx_tokens)
+
+    def record_rejection(
+        self,
+        model: str,
+        backend: str,
+        reason: str,
+        *,
+        tier_kv_pct: str = "0",
+    ) -> None:
+        """Count one rejected request by its refusal reason.
+
+        ``reason`` is the reported rejector's machine-readable code
+        (``exceeds_tier`` / ``auto_exceeds_headroom``) or the sentinel
+        ``all_backends_failed`` on 502 exhaustion. ``tier_kv_pct`` is the
+        governing tier's ``kv_pct`` (percentage) as a string when the tiered
+        layer is the rejector, else ``"0"``. Pure side effect — never alters
+        the decision.
+        """
+        self._rejections_total.labels(model, backend, reason, tier_kv_pct).inc()
 
     def record_failover(self, model: str, from_backend: str, to_backend: str, reason: str) -> None:
         """Count one pre-stream failover skip (decision 12).

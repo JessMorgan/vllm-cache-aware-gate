@@ -476,6 +476,71 @@ def test_metrics_counts_forwarded_and_rejected() -> None:
     )
 
 
+# --- /metrics: gate_rejections_total (refusal reason) -------------------------
+
+
+def test_rejections_total_tiered_reason() -> None:
+    """A tiered-layer 429 records reason="exceeds_tier" with the governing
+    tier's kv_pct as the tier_kv_pct label."""
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    cache.update(0.90)  # 90% -> 80-tier active, max_context 1024
+    cfg = make_config()
+    body = chat_body(5000)  # estimate ~1506 > 1024
+    assert estimate_context_tokens(body, cfg) > 1024
+    with build_app(cfg, cache, fake) as client:
+        resp = client.post("/v1/chat/completions", content=body, headers=JSON_HEADERS)
+        assert resp.status_code == 429
+        metrics_body = client.get("/metrics").text
+    # Alphabetical label order: backend, model, reason, tier_kv_pct.
+    assert (
+        'gate_rejections_total{backend="vllm",model="m",reason="exceeds_tier",'
+        'tier_kv_pct="80"} 1.0' in metrics_body
+    )
+
+
+def test_rejections_total_autoconfig_reason() -> None:
+    """An autoconfig-layer 429 (no tiers) records
+    reason="auto_exceeds_headroom" with tier_kv_pct="0"."""
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    cache.update(0.50)  # fresh feed; no tiers -> tiered layer always allows
+    counter = KvRemaining()
+    counter.reanchor(100)
+    cfg = zero_config()
+    body = chat_body(100)  # effective ceil(281*1.25) = 352 > 100
+    with build_app(cfg, cache, fake, counter=counter) as client:
+        resp = client.post("/v1/chat/completions", content=body, headers=JSON_HEADERS)
+        assert resp.status_code == 429
+        metrics_body = client.get("/metrics").text
+    assert (
+        'gate_rejections_total{backend="vllm",model="m",'
+        'reason="auto_exceeds_headroom",tier_kv_pct="0"} 1.0' in metrics_body
+    )
+
+
+def test_rejections_total_all_backends_failed_reason() -> None:
+    """Every candidate transport-failed -> 502, and gate_rejections_total
+    records reason="all_backends_failed" with the "none" sentinel backend."""
+
+    def _raise(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated transport failure")
+
+    app = create_app(
+        make_config(),
+        upstream=httpx.AsyncClient(transport=httpx.MockTransport(_raise)),
+        start_poller=False,
+    )
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", content=chat_body(100), headers=JSON_HEADERS)
+        assert resp.status_code == 502
+        metrics_body = client.get("/metrics").text
+    assert (
+        'gate_rejections_total{backend="none",model="m",'
+        'reason="all_backends_failed",tier_kv_pct="0"} 1.0' in metrics_body
+    )
+
+
 def test_metrics_per_model_series() -> None:
     fake = FakeVLLM()
     cache = MetricsCache()

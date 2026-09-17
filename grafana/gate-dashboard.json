@@ -3,7 +3,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -21,45 +24,78 @@
   "panels": [
     {
       "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": null },
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "id": 100,
       "panels": [],
       "title": "Backend health",
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Count of backends whose /metrics feed is fresh (gate_metrics_fresh = 1). Red when any backend is stale or never fetched — a stale feed fails open, so traffic is still forwarded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Count of backends whose /metrics feed is fresh (gate_metrics_fresh = 1). Red when any backend is stale or never fetched \u2014 a stale feed fails open, so traffic is still forwarded.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
       "id": 1,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["min"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "min"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "count(gate_metrics_fresh{backend=~\"$backend\"})",
           "legendFormat": "fresh backends",
           "refId": "A"
@@ -69,37 +105,62 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "description": "Count of backends whose /metrics feed is stale or never fetched (gate_metrics_fresh = 0). Red when greater than 0.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
       "id": 2,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["min"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "min"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "count(gate_metrics_fresh{backend=~\"$backend\"} == 0)",
           "legendFormat": "stale backends",
           "refId": "A"
@@ -109,37 +170,62 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "description": "Backends whose observed /metrics body lacks a usable KV-cache capacity (gate_backend_capacity_unavailable = 1). Their autoconfig layer fails open; the process keeps running.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
       "id": 3,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["min"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "min"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "count(gate_backend_capacity_unavailable{backend=~\"$backend\"} == 1)",
           "legendFormat": "capacity-unavailable backends",
           "refId": "A"
@@ -149,37 +235,62 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Backends whose /metrics endpoint is reachable-but-unrecognizable (gate_metrics_endpoint_unavailable = 1) — e.g. SGLang launched without --enable-metrics. 0 once a real engine is detected.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Backends whose /metrics endpoint is reachable-but-unrecognizable (gate_metrics_endpoint_unavailable = 1) \u2014 e.g. SGLang launched without --enable-metrics. 0 once a real engine is detected.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
       "id": 4,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["min"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "min"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "count(gate_metrics_endpoint_unavailable{backend=~\"$backend\"} == 1)",
           "legendFormat": "metrics-endpoint-unavailable backends",
           "refId": "A"
@@ -189,39 +300,65 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Currently detected inference engine per backend (gate_backend_engine; auto-detected from the /metrics body: vllm, sglang, or unknown).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Currently detected inference engine per backend (gate_backend_engine; auto-detected from the /metrics body: vllm, sglang, or unknown). The stat shows the detected engine directly as 'backend: engine' (name mode) \u2014 no hover needed.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "transparent", "value": null }
+              {
+                "color": "transparent",
+                "value": null
+              }
             ]
           },
           "unit": "string"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 1 },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
       "id": 5,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "showThresholdLabels": false,
         "showThresholdMarkers": false,
-        "text": { "mode": "value", "titleSize": 14, "valueSize": 16 },
-        "textMode": "value"
+        "text": {
+          "mode": "value",
+          "titleSize": 14,
+          "valueSize": 16
+        },
+        "textMode": "name"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "gate_backend_engine{backend=~\"$backend\"} == 1",
           "format": "time_series",
           "instant": true,
@@ -234,19 +371,32 @@
     },
     {
       "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": null },
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
       "id": 101,
       "panels": [],
       "title": "KV cache",
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Current KV-cache usage percentage (0-100) per served model, from the backends' vllm:kv_cache_usage_perc / sglang:kv_cache_usage_perc gauges (gate_kv_cache_usage_pct). Keyed by the engine's model_name label ('default' when unlabeled) — a different namespace from the request-body model used by the $model variable, so this panel shows all served models and is not filtered by $model. The gate takes the max across backends on a repeated key.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Current KV-cache usage percentage (0-100) per served model, from the backends' vllm:kv_cache_usage_perc / sglang:kv_cache_usage_perc gauges (gate_kv_cache_usage_pct). Keyed by the engine's model_name label ('default' when unlabeled) \u2014 a different namespace from the request-body model used by the $model variable, so this panel shows all served models and is not filtered by $model. The gate takes the max across backends on a repeated key.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -261,23 +411,45 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 100 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
             ]
           },
           "unit": "percent"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 7
+      },
       "id": 6,
       "options": {
-        "legend": { "calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "gate_kv_cache_usage_pct",
           "legendFormat": "{{model_name}}",
           "refId": "A"
@@ -287,38 +459,67 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "The gate's own live estimate of remaining KV-cache tokens up to the target per backend (gate_kv_cache_remaining_tokens). Re-anchored on every good poll; NaN until anchored. The counter is unclamped — red when negative (over-committed signal), green at 0 or above.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "The gate's own live estimate of remaining KV-cache tokens up to the target per backend (gate_kv_cache_remaining_tokens). Re-anchored on every good poll; NaN until anchored. The counter is unclamped \u2014 red when negative (over-committed signal), green at 0 or above.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 0 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 7
+      },
       "id": 7,
       "options": {
         "colorMode": "background",
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "horizontal",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "text": { "mode": "value", "titleSize": 14, "valueSize": 16 },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "text": {
+          "mode": "value",
+          "titleSize": 14,
+          "valueSize": 16
+        },
         "textMode": "value"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "sum by (backend) (gate_kv_cache_remaining_tokens{backend=~\"$backend\"})",
           "legendFormat": "{{backend}}",
           "refId": "A"
@@ -329,45 +530,78 @@
     },
     {
       "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": null },
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
       "id": 102,
       "panels": [],
       "title": "Traffic",
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "description": "Rate of generation requests decided by the gate (gate_requests_total), forwarded + rejected, across all endpoints, models, and backends.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 0.0001 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.0001
+              }
             ]
           },
           "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 16 },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 16
+      },
       "id": 8,
       "options": {
         "colorMode": "background",
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "sum(rate(gate_requests_total{backend=~\"$backend\", model=~\"$model\"}[5m]))",
           "legendFormat": "requests/s",
           "refId": "A"
@@ -377,38 +611,66 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "description": "Rate of rejected requests (429/502 exhaustion). The backend label is the max-timeout rejector on 429 exhaustion or the sentinel 'none' on 502 exhaustion.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "orange", "value": 0.0001 },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.0001
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           },
           "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 16 },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 16
+      },
       "id": 9,
       "options": {
         "colorMode": "background",
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "sum(rate(gate_requests_total{result=\"rejected\", backend=~\"$backend\", model=~\"$model\"}[5m]))",
           "legendFormat": "rejected/s",
           "refId": "A"
@@ -418,11 +680,16 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "description": "Requests per second by result (forwarded / rejected) and final backend (the forwarder, the max-timeout rejector on 429 exhaustion, or 'none' on 502 exhaustion).",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -435,22 +702,41 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              {
+                "color": "green",
+                "value": null
+              }
             ]
           },
           "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 8, "y": 16 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 8,
+        "y": 16
+      },
       "id": 10,
       "options": {
-        "legend": { "calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "sum by (result, backend) (rate(gate_requests_total{backend=~\"$backend\", model=~\"$model\"}[5m]))",
           "legendFormat": "{{result}} / {{backend}}",
           "refId": "A"
@@ -460,11 +746,16 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "description": "Requests per second by the request body's model (the routing key).",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -477,22 +768,41 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              {
+                "color": "green",
+                "value": null
+              }
             ]
           },
           "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 25 },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
       "id": 11,
       "options": {
-        "legend": { "calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "sum by (model) (rate(gate_requests_total{model=~\"$model\", backend=~\"$backend\"}[5m]))",
           "legendFormat": "{{model}}",
           "refId": "A"
@@ -502,109 +812,216 @@
       "type": "timeseries"
     },
     {
-      "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": null },
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
-      "id": 103,
-      "panels": [],
-      "title": "Context tokens",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Median estimated context tokens (prompt + headroom) of requests (gate_request_ctx_tokens). The estimate is a heuristic biased to over-estimate; NaN when there are no observations in the window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Requests and refusals per second, split by the request body's model (the routing key), the final backend (the forwarder, the max-timeout rejector on 429 exhaustion, or 'none' on 502 exhaustion), and the result (forwarded / rejected).",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 0 }
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 33
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
+          "expr": "sum by (model, backend, result) (rate(gate_requests_total{model=~\"$model\", backend=~\"$backend\"}[5m]))",
+          "legendFormat": "{{model}} / {{backend}} / {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Requests & refusals by model + backend",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Share of requests the gate forwards (result=forwarded) out of all requests decided (forwarded + rejected), in percent. 100% = nothing is being refused; a dip tracks the refusal rate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
+          "expr": "100 * sum(rate(gate_requests_total{result=\"forwarded\", model=~\"$model\", backend=~\"$backend\"}[5m])) / sum(rate(gate_requests_total{model=~\"$model\", backend=~\"$backend\"}[5m]))",
+          "legendFormat": "% permitted",
+          "refId": "A"
+        }
+      ],
+      "title": "% permitted",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Median (p50) estimated context-token size of refused requests (gate_request_ctx_tokens, result=rejected). NaN when no requests were refused in the window. Useful with the refusal-reasons panel to see whether refusals are driven by large prompts.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 34 },
-      "id": 12,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 41
       },
-      "pluginVersion": "11.1.0",
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": null },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(gate_request_ctx_tokens_bucket{model=~\"$model\", backend=~\"$backend\"}[5m])))",
-          "legendFormat": "p50 ctx tokens",
-          "refId": "A"
-        }
-      ],
-      "title": "Median ctx tokens",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "95th-percentile estimated context tokens of requests (gate_request_ctx_tokens). NaN when there are no observations in the window.",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 0 }
-            ]
-          },
-          "unit": "short"
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
-        "overrides": []
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
-      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 34 },
-      "id": 13,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
-      },
-      "pluginVersion": "11.1.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(gate_request_ctx_tokens_bucket{model=~\"$model\", backend=~\"$backend\"}[5m])))",
-          "legendFormat": "p95 ctx tokens",
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(gate_request_ctx_tokens_bucket{result=\"rejected\", model=~\"$model\", backend=~\"$backend\"}[5m])))",
+          "legendFormat": "p50 refused ctx tokens",
           "refId": "A"
         }
       ],
-      "title": "p95 ctx tokens",
-      "type": "stat"
+      "title": "Median size of refused requests (tokens)",
+      "type": "timeseries"
     },
     {
-      "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": null },
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
-      "id": 104,
-      "panels": [],
-      "title": "Routing & failover",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Pre-stream failover skips per second (gate_routing_failovers_total): a candidate rejected (429), transport-failed, or returned a pre-stream upstream 5xx, so the walk moved to the next candidate. Stacked by reason (reject / transport / upstream_5xx) and source/destination backend.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Refusals per second by reason and backend (gate_rejections_total). reason: exceeds_tier = the tiered 'max context' layer (the request's estimated context exceeds the governing tier's max_context); auto_exceeds_headroom = the autoconfig headroom layer (estimated context x token_margin exceeds the backend's estimated remaining KV); all_backends_failed = every candidate transport-failed (502). The tier_kv_pct label identifies which threshold tier governed (the tier's kv_pct percentage; '0' when the tiered layer is not the rejector) \u2014 it is intentionally NOT in the legend to keep it readable; add it to the query if you need it.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 40,
@@ -617,24 +1034,273 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 49
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
+          "expr": "sum by (reason, backend) (rate(gate_rejections_total{backend=~\"$backend\", model=~\"$model\"}[5m]))",
+          "legendFormat": "{{reason}} / {{backend}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Refusal reasons by backend",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 57
+      },
+      "id": 103,
+      "panels": [],
+      "title": "Context tokens",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Median estimated context tokens (prompt + headroom) of requests (gate_request_ctx_tokens). The estimate is a heuristic biased to over-estimate; NaN when there are no observations in the window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 58
+      },
+      "id": 12,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.1.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(gate_request_ctx_tokens_bucket{model=~\"$model\", backend=~\"$backend\"}[5m])))",
+          "legendFormat": "p50 ctx tokens",
+          "refId": "A"
+        }
+      ],
+      "title": "Median ctx tokens",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "95th-percentile estimated context tokens of requests (gate_request_ctx_tokens). NaN when there are no observations in the window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 58
+      },
+      "id": 13,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.1.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gate_request_ctx_tokens_bucket{model=~\"$model\", backend=~\"$backend\"}[5m])))",
+          "legendFormat": "p95 ctx tokens",
+          "refId": "A"
+        }
+      ],
+      "title": "p95 ctx tokens",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 63
+      },
+      "id": 104,
+      "panels": [],
+      "title": "Routing & failover",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
+      "description": "Pre-stream failover skips per second (gate_routing_failovers_total): a candidate rejected (429), transport-failed, or returned a pre-stream upstream 5xx, so the walk moved to the next candidate. Stacked by reason (reject / transport / upstream_5xx) and source/destination backend.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
             ]
           },
           "unit": "ops"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
       "id": 14,
       "options": {
-        "legend": { "calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "sum by (reason, from, to) (rate(gate_routing_failovers_total{model=~\"$model\"}[5m]))",
-          "legendFormat": "{{reason}}: {{from}} → {{to}}",
+          "legendFormat": "{{reason}}: {{from}} \u2192 {{to}}",
           "refId": "A"
         }
       ],
@@ -642,11 +1308,16 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": null },
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "description": "Pre-stream failover skips per second by the request's model (gate_routing_failovers_total).",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -659,22 +1330,41 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              {
+                "color": "green",
+                "value": null
+              }
             ]
           },
           "unit": "ops"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
       "id": 15,
       "options": {
-        "legend": { "calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": null },
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "expr": "sum by (model) (rate(gate_routing_failovers_total{model=~\"$model\"}[5m]))",
           "legendFormat": "{{model}}",
           "refId": "A"
@@ -682,166 +1372,31 @@
       ],
       "title": "Failover skips/s by model",
       "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": null },
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
-      "id": 105,
-      "panels": [],
-      "title": "Configuration & feed freshness",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Loaded gate configuration (gate_config_info), set once at startup. The *_json columns are parsed JSON: thresholds_json = [[kv_pct, max_context, timeout_s], ...]; backends_json = [{name, host, port, default, overrides}, ...]; routing_json = [[model, policy, [order...]], ...].",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
-      "id": 16,
-      "options": {
-        "cellHeight": "sm",
-        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
-        "showHeader": true
-      },
-      "pluginVersion": "11.1.0",
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": null },
-          "expr": "gate_config_info",
-          "format": "table",
-          "instant": true,
-          "refId": "A"
-        }
-      ],
-      "title": "gate_config_info (startup-static)",
-      "transformations": [
-        {
-          "id": "labelsToFields",
-          "options": { "renameLabels": false }
-        },
-        {
-          "id": "convertFieldType",
-          "options": {
-            "conversions": [
-              { "targetField": "thresholds_json", "destinationType": "other" },
-              { "targetField": "backends_json", "destinationType": "other" },
-              { "targetField": "routing_json", "destinationType": "other" }
-            ]
-          }
-        }
-      ],
-      "type": "table"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Gate listen address (gate_config_info listen_host / listen_port labels).",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "transparent", "value": null }
-            ]
-          },
-          "unit": "string"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 49 },
-      "id": 17,
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
-      },
-      "pluginVersion": "11.1.0",
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": null },
-          "expr": "gate_config_info",
-          "format": "time_series",
-          "instant": true,
-          "legendFormat": "{{listen_host}}:{{listen_port}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Listen address",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "description": "Seconds since the last successful /metrics fetch per backend (gate_metrics_age_s); NaN if never fetched. Red threshold at 6s (the gate's default stale_after_s — adjust the panel threshold if you override stale_after_s in config; the exact configured value is shown in the gate_config_info table). Past it the feed is stale and the gate fails open for that backend.",
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 6 }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 57 },
-      "id": 18,
-      "options": {
-        "legend": { "calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": null },
-          "expr": "gate_metrics_age_s{backend=~\"$backend\"}",
-          "legendFormat": "{{backend}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Metrics feed age (per backend)",
-      "type": "timeseries"
     }
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["gate", "vllm", "sglang"],
+  "tags": [
+    "gate",
+    "vllm",
+    "sglang"
+  ],
   "templating": {
     "list": [
       {
-        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
-        "datasource": { "type": "prometheus", "uid": null },
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": null
+        },
         "definition": "label_values(gate_metrics_fresh, backend)",
         "description": "Backend name (from the backends: config section).",
         "hide": 0,
@@ -850,15 +1405,30 @@
         "multi": true,
         "name": "backend",
         "options": [],
-        "query": { "qryType": 1, "query": "label_values(gate_metrics_fresh, backend)", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(gate_metrics_fresh, backend)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
         "refresh": 2,
         "regex": "",
         "sort": 1,
         "type": "query"
       },
       {
-        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
-        "datasource": { "type": "prometheus", "uid": null },
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": null
+        },
         "definition": "label_values(gate_requests_total, model)",
         "description": "Request body model (the routing key).",
         "hide": 0,
@@ -867,7 +1437,11 @@
         "multi": true,
         "name": "model",
         "options": [],
-        "query": { "qryType": 1, "query": "label_values(gate_requests_total, model)", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(gate_requests_total, model)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -875,10 +1449,13 @@
       }
     ]
   },
-  "time": { "from": "now-15m", "to": "now" },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
-  "title": "vLLM Gate — KV-cache-aware reverse proxy",
+  "title": "vLLM Gate \u2014 KV-cache-aware reverse proxy",
   "uid": "vllm-gate",
   "version": 1,
   "weekStart": 0

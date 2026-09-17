@@ -254,7 +254,15 @@ FastAPI app wires together.
     recoverable from the model), `record_failover(model, from, to, reason)`
     (the `gate_routing_failovers_total{model, from, to, reason}` counter —
     pre-stream failover skips, reason ∈ `transport` | `upstream_5xx` |
-    `reject`), `set_kv_usage` (fraction→percent, removes stale model series;
+    `reject`), `record_rejection(model, backend, reason, *, tier_kv_pct="0")`
+    (the `gate_rejections_total{model, backend, reason, tier_kv_pct}` counter
+    — rejected requests by refusal reason: `exceeds_tier` (the tiered "max
+    context" layer) | `auto_exceeds_headroom` (the autoconfig headroom layer) |
+    `all_backends_failed` (every candidate transport-failed → 502);
+    `tier_kv_pct` is the governing tier's `kv_pct` percentage (as a string)
+    when the tiered layer is the rejector, else `"0"`; `backend` is the
+    reported rejector on 429 exhaustion or `"none"` on 502; pure side effect),
+    `set_kv_usage` (fraction→percent, removes stale model series;
     the app unions all backends' by-model maps, max on key collisions),
     `set_freshness(backend, fresh, age_s)`, `set_remaining(backend, int | None)`
     (the `gate_kv_cache_remaining_tokens{backend}` gauge — the gate's own live
