@@ -33,11 +33,19 @@ Invariants (see AGENTS.md "Known gotchas"):
   exhaustion, or the sentinel ``"none"`` on 502 exhaustion (no rejector
   exists). ``gate_routing_failovers_total{model, from, to, reason}`` counts
   pre-stream failover skips (reason ∈ ``transport`` | ``upstream_5xx`` |
-  ``reject``; decision 12). ``gate_backend_capacity_unavailable{backend}`` is
-  the per-backend alert flag for a live-but-capacity-less ``/metrics`` body
-  (per-backend fail-open, decision 10). ``gate_config_info`` serializes the
-  backend structure and the ``routing:`` section (``routing_json``:
-  ``[[model, policy, [order...]], ...]``, startup-static for operator audit).
+   ``reject``; decision 12). ``gate_backend_capacity_unavailable{backend}`` is
+   the per-backend alert flag for a live-but-capacity-less ``/metrics`` body
+   (per-backend fail-open, decision 10). ``gate_backend_engine{backend,
+   engine}`` (engine ∈ ``vllm`` | ``sglang`` | ``unknown``) is the per-backend
+   detected-engine gauge — ``1`` for the currently detected engine, ``0`` for
+   the others (``unknown=1`` is the initial state before any detection;
+   docs/plans/sglang-backend.md §2.5). ``gate_metrics_endpoint_unavailable{
+   backend}`` is the per-backend alert flag for a reachable-but-unrecognizable
+   ``/metrics`` endpoint (non-200, or a 200 body with no recognizable KV-cache
+   gauge — e.g. SGLang launched without ``--enable-metrics``); ``0`` once a
+   real engine is detected. ``gate_config_info`` serializes the backend
+   structure and the ``routing:`` section (``routing_json``:
+   ``[[model, policy, [order...]], ...]``, startup-static for operator audit).
 
 - A per-app registry is required: the app creates one ``GateStats`` per
   process, and tests create many apps, so the global default registry must
@@ -75,6 +83,10 @@ CTX_TOKENS_BUCKETS: tuple[int, ...] = (
     131072,
     262144,
 )
+
+#: The engine label values for ``gate_backend_engine`` (docs/plans/sglang-backend.md §2.5).
+#: Kept local (not imported from gate.metrics) so this module stays independent.
+_ENGINE_LABELS: tuple[str, ...] = ("vllm", "sglang", "unknown")
 
 
 class GateStats:
@@ -147,6 +159,21 @@ class GateStats:
             "gate_backend_capacity_unavailable",
             "1 if the backend's observed /metrics body lacks a usable KV-cache "
             "capacity (its autoconfig layer fails open), 0 otherwise.",
+            ["backend"],
+            registry=self._registry,
+        )
+        self._backend_engine = Gauge(
+            "gate_backend_engine",
+            "The currently detected inference engine per backend (1 for the detected "
+            "engine, 0 for the others; engine is auto-detected from the /metrics body).",
+            ["backend", "engine"],
+            registry=self._registry,
+        )
+        self._metrics_endpoint_unavailable = Gauge(
+            "gate_metrics_endpoint_unavailable",
+            "1 if the backend's /metrics endpoint is unavailable (a non-200 response, "
+            "e.g. SGLang launched without --enable-metrics, or a 200 body with no "
+            "recognizable KV-cache gauge), 0 once a real engine is detected.",
             ["backend"],
             registry=self._registry,
         )
@@ -239,6 +266,27 @@ class GateStats:
         render (decision 10 of docs/plans/multi-backend.md).
         """
         self._capacity_unavailable.labels(backend).set(1.0 if unavailable else 0.0)
+
+    def set_backend_engine(self, backend: str, engine: str) -> None:
+        """Set one backend's detected-engine gauge (docs/plans/sglang-backend.md §2.5).
+
+        Sets the currently detected ``engine`` series to ``1.0`` and the other
+        engine series to ``0.0`` so the gauge is always fully populated and
+        scrape-able (``unknown=1`` is the initial state before any detection).
+        The app calls this for every backend on each ``/metrics`` render.
+        """
+        for label in _ENGINE_LABELS:
+            self._backend_engine.labels(backend, label).set(1.0 if label == engine else 0.0)
+
+    def set_backend_metrics_unavailable(self, backend: str, unavailable: bool) -> None:
+        """Set one backend's metrics-endpoint-unavailable alert flag (0/1).
+
+        ``1`` while the backend's ``/metrics`` is reachable-but-unrecognizable
+        (non-200, or a 200 body with no recognizable KV gauge); ``0`` once a real
+        engine is detected. The app calls this for every backend on each
+        ``/metrics`` render (docs/plans/sglang-backend.md §2.5).
+        """
+        self._metrics_endpoint_unavailable.labels(backend).set(1.0 if unavailable else 0.0)
 
     def render(self) -> bytes:
         """Render the current metrics in Prometheus exposition format."""

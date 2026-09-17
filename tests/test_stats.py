@@ -5,9 +5,11 @@ Covers the multi-backend additions (docs/plans/multi-backend.md §2.5): the
 ``gate_backend_capacity_unavailable`` gauge, the ``backend`` label on the
 request counters (decision 13 — with duplicate model ids legal, the backend
 is no longer recoverable from the model; the sentinel ``"none"`` on 502
-exhaustion), the ``gate_routing_failovers_total`` counter (decision 12), and
-the ``gate_config_info`` backend-structure + ``routing:`` serialization
-(which omits the ``models:`` lists).
+exhaustion), the ``gate_routing_failovers_total`` counter (decision 12), the SGLang
+additions (docs/plans/sglang-backend.md §2.5: the ``gate_backend_engine``
+detected-engine gauge and the ``gate_metrics_endpoint_unavailable`` alert
+flag), and the ``gate_config_info`` backend-structure + ``routing:``
+serialization (which omits the ``models:`` lists).
 """
 
 from __future__ import annotations
@@ -357,6 +359,66 @@ class TestBackendCapacityUnavailable:
         stats = make_stats()
         for family in text_string_to_metric_families(stats.render().decode()):
             if family.name == "gate_backend_capacity_unavailable":
+                assert list(family.samples) == []
+
+
+class TestBackendEngine:
+    def test_set_detected_engine(self) -> None:
+        # The detected engine's series is 1.0 and the other two are
+        # explicitly 0.0 (not absent) so the gauge is always fully
+        # populated (docs/plans/sglang-backend.md §2.5). Prometheus renders
+        # labels alphabetically: backend, engine.
+        stats = make_stats()
+        stats.set_backend_engine("qwen", "sglang")
+        text = stats.render().decode()
+        assert 'gate_backend_engine{backend="qwen",engine="sglang"} 1.0' in text
+        assert 'gate_backend_engine{backend="qwen",engine="vllm"} 0.0' in text
+        assert 'gate_backend_engine{backend="qwen",engine="unknown"} 0.0' in text
+
+    def test_per_backend_independent(self) -> None:
+        # Each backend's detected engine is its own set of series.
+        stats = make_stats()
+        stats.set_backend_engine("qwen", "vllm")
+        stats.set_backend_engine("llama", "sglang")
+        text = stats.render().decode()
+        assert 'gate_backend_engine{backend="qwen",engine="vllm"} 1.0' in text
+        assert 'gate_backend_engine{backend="qwen",engine="sglang"} 0.0' in text
+        assert 'gate_backend_engine{backend="llama",engine="sglang"} 1.0' in text
+        assert 'gate_backend_engine{backend="llama",engine="vllm"} 0.0' in text
+
+    def test_initial_state_before_set(self) -> None:
+        # The app sets every backend on each render; before that the family
+        # has no samples (the HELP/TYPE lines always render).
+        stats = make_stats()
+        for family in text_string_to_metric_families(stats.render().decode()):
+            if family.name == "gate_backend_engine":
+                assert list(family.samples) == []
+
+
+class TestMetricsEndpointUnavailable:
+    def test_set_and_clear(self) -> None:
+        stats = make_stats()
+        stats.set_backend_metrics_unavailable("qwen", True)
+        text = stats.render().decode()
+        assert 'gate_metrics_endpoint_unavailable{backend="qwen"} 1.0' in text
+        stats.set_backend_metrics_unavailable("qwen", False)
+        text = stats.render().decode()
+        assert 'gate_metrics_endpoint_unavailable{backend="qwen"} 0.0' in text
+
+    def test_per_backend_independent(self) -> None:
+        stats = make_stats()
+        stats.set_backend_metrics_unavailable("qwen", True)
+        stats.set_backend_metrics_unavailable("llama", False)
+        text = stats.render().decode()
+        assert 'gate_metrics_endpoint_unavailable{backend="qwen"} 1.0' in text
+        assert 'gate_metrics_endpoint_unavailable{backend="llama"} 0.0' in text
+
+    def test_initial_state_before_set(self) -> None:
+        # The app sets every backend on each render; before that the family
+        # has no samples (the HELP/TYPE lines always render).
+        stats = make_stats()
+        for family in text_string_to_metric_families(stats.render().decode()):
+            if family.name == "gate_metrics_endpoint_unavailable":
                 assert list(family.samples) == []
 
 
