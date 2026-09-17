@@ -106,7 +106,10 @@ Invariants (see AGENTS.md "Known gotchas"):
   buffered (gotcha #6), to the forwarded candidate's ``base_url``.
 
 The app also exposes ``GET /metrics`` (Prometheus ``gate_*`` stats from
-:mod:`gate.stats`, with per-backend labels on the feed/remaining gauges and
+:mod:`gate.stats`, with per-backend labels on the feed/remaining gauges, the
+per-backend ``gate_backend_engine{backend,engine}`` and
+``gate_metrics_endpoint_unavailable{backend}`` gauges (the detected engine and
+the reachable-but-unrecognizable flag, docs/plans/sglang-backend.md §2.5), and
 the ``backend`` label on the request counters), ``GET /v1/models``
 (gate-local aggregate of the registry's known models with an ``owned_by``
 extension — a list when 2+ backends serve the model, a scalar when
@@ -133,7 +136,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from gate.config import GateConfig, Threshold
-from gate.metrics import CapacityCache, KvRemaining, MetricsCache
+from gate.metrics import ENGINE_UNKNOWN, CapacityCache, KvRemaining, MetricsCache
 from gate.models import ModelRegistry
 from gate.poller import run_poller
 from gate.proxy import proxy_request
@@ -175,7 +178,13 @@ class BackendState:
     per-backend monotonic anchor sequence, incremented by the poller's
     ``on_reanchor`` callback on every re-anchor — the failover
     charge-rollback guard (decision 12) compares it to decide whether a
-    rolled-back charge is still valid.
+    rolled-back charge is still valid. ``engine`` is the currently detected
+    engine (``ENGINE_UNKNOWN`` until the first detection), set by the app's
+    ``on_engine`` closure; ``metrics_unavailable`` is the per-backend
+    reachable-but-unrecognizable flag, set to whatever the app's
+    ``on_metrics_unavailable`` closure is invoked with (the new state, either
+    direction) — the ``False`` recovery transition rides that state callback,
+    NOT the engine setter (docs/plans/sglang-backend.md §2.4).
     """
 
     name: str
@@ -193,6 +202,8 @@ class BackendState:
     auto_policy: AutoPolicy
     capacity_unavailable: bool = False
     anchor_seq: int = 0
+    engine: str = ENGINE_UNKNOWN
+    metrics_unavailable: bool = False
 
 
 class RoutingState:
@@ -253,6 +264,39 @@ def _on_reanchor_setter(bs: BackendState) -> Callable[[], None]:
     return _bump
 
 
+def _on_engine_setter(bs: BackendState) -> Callable[[str], None]:
+    """A callback that records one backend's detected engine.
+
+    The poller invokes it when the detected engine differs from the last
+    detected one (first detection and any change, including to/from
+    unknown). One closure is created per backend so the right backend's
+    engine is the one recorded (docs/plans/sglang-backend.md section 2.4).
+    """
+
+    def _set(engine: str) -> None:
+        bs.engine = engine
+
+    return _set
+
+
+def _metrics_unavailable_setter(bs: BackendState) -> Callable[[bool], None]:
+    """A callback that records one backend's metrics-endpoint-unavailable state.
+
+    The poller invokes it with the NEW state whenever the unavailable state
+    changes (either direction): True for a non-200 response or a 200 body
+    detected unknown, False for a 200 body detected vllm/sglang. The app
+    owns the flag; the poller only signals. The False recovery transition
+    rides THIS callback (not the engine setter) — so a 404 -> healthy-vllm
+    recovery (engine unchanged) still clears the flag
+    (docs/plans/sglang-backend.md section 2.4).
+    """
+
+    def _set(unavailable: bool) -> None:
+        bs.metrics_unavailable = unavailable
+
+    return _set
+
+
 def _is_streaming(body: bytes) -> bool:
     """True iff ``body`` parses to a JSON object with ``"stream": true``.
 
@@ -293,7 +337,7 @@ def _reject_message(
         usage_str = f"{usage_pct:.1f}" if usage_pct is not None else "?"
         ctx_str = f"~{ctx_tokens}" if ctx_tokens is not None else "?"
         return (
-            f"backend {backend} (model {model}): vLLM KV cache too full for a "
+            f"backend {backend} (model {model}): KV cache too full for a "
             f"{ctx_str}-token request "
             f"(usage {usage_str}% >= {tier.kv_pct:g}% tier; "
             f"max {tier.max_context}). "
@@ -306,14 +350,14 @@ def _reject_message(
         target_str = f"{target_pct:g}" if target_pct is not None else "?"
         retry = dec.retry_after if dec.retry_after is not None else 0
         return (
-            f"backend {backend} (model {model}): vLLM KV cache headroom exhausted "
+            f"backend {backend} (model {model}): KV cache headroom exhausted "
             f"for a ~{ctx_tokens}-token request "
             f"(usage {usage_str}%, ~{remaining_str} of {capacity_str} tokens "
             f"remaining up to the {target_str}% target). "
             f"Retry in {retry}s."
         )
     retry = dec.retry_after if dec.retry_after is not None else 0
-    return f"backend {backend} (model {model}): vLLM KV cache too full. Retry in {retry}s."
+    return f"backend {backend} (model {model}): KV cache too full. Retry in {retry}s."
 
 
 def _poller_fatal(task: asyncio.Task[None]) -> None:
@@ -456,6 +500,8 @@ def create_app(
                             explicit_models=bs.models,
                             capacity_unavailable=_capacity_flag_setter(bs),
                             on_reanchor=_on_reanchor_setter(bs),
+                            on_engine=_on_engine_setter(bs),
+                            on_metrics_unavailable=_metrics_unavailable_setter(bs),
                             routing_order=routing_order,
                         )
                     )
@@ -885,6 +931,8 @@ def create_app(
             stats.set_freshness(bs.name, not bs.cache.is_stale(cfg.stale_after_s), bs.cache.age())
             stats.set_remaining(bs.name, bs.counter.value())
             stats.set_backend_capacity_unavailable(bs.name, bs.capacity_unavailable)
+            stats.set_backend_engine(bs.name, bs.engine)
+            stats.set_backend_metrics_unavailable(bs.name, bs.metrics_unavailable)
         return Response(content=stats.render(), media_type=_METRICS_CONTENT_TYPE)
 
     return app
