@@ -189,10 +189,12 @@ async def test_observed_without_capacity_is_not_fatal() -> None:
         cache = MetricsCache()
         counter = KvRemaining()
         calls = 0
+        states: list[bool] = []
 
-        def on_unavailable() -> None:
+        def on_unavailable(state: bool) -> None:
             nonlocal calls
             calls += 1
+            states.append(state)
 
         task = asyncio.create_task(
             run_poller(
@@ -207,7 +209,10 @@ async def test_observed_without_capacity_is_not_fatal() -> None:
         )
         await asyncio.sleep(0.05)  # several capacity-missing ticks; no raise
         assert not task.done()  # the loop is still running
-        assert calls >= 1  # the alert callback was invoked
+        # State-change only: the callback fired exactly once, on the
+        # transition into capacity-missing (None -> True), with True.
+        assert calls == 1
+        assert states == [True]
         assert counter.value() is None  # never anchored (autoconfig fails open)
         assert cache.value() == pytest.approx(0.55)  # usage still recorded
         task.cancel()
@@ -248,6 +253,49 @@ async def test_capacity_missing_unanchors_previously_anchored_counter() -> None:
         await asyncio.sleep(0.05)  # several capacity-missing ticks
         assert counter.value() is None  # unanchored -> autoconfig fails open
         assert not task.done()  # the loop is still running
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_capacity_unavailable_callback_is_state_change_and_clears_on_recovery() -> None:
+    """The capacity_unavailable callback fires on a state change (either
+    direction), so the app's alert flag is set on the transition into
+    capacity-missing AND cleared when a later observed body provides capacity
+    again — it is not a sticky one-way ratchet."""
+    body = {"text": METRICS_055}  # start: usage present, NO capacity
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body["text"])
+
+    transport = httpx.MockTransport(handler)
+    states: list[bool] = []
+
+    def on_unavailable(state: bool) -> None:
+        states.append(state)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        cache = MetricsCache()
+        counter = KvRemaining()
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                cache,
+                "http://x/metrics",
+                0.01,
+                counter=counter,
+                target_frac=0.85,
+                capacity_unavailable=on_unavailable,
+            )
+        )
+        await asyncio.sleep(0.05)  # several capacity-missing ticks
+        # Transition None -> True fired once (state-change only, not per tick).
+        assert states == [True]
+        body["text"] = METRICS_BOTH  # recover: capacity gauge returns
+        await asyncio.sleep(0.05)  # several capacity-present ticks
+        # Transition True -> False fired (recovery clears the flag).
+        assert states == [True, False]
+        assert counter.value() is not None  # re-anchored by the capacity-carrying body
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

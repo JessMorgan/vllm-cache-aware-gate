@@ -173,8 +173,10 @@ class BackendState:
     ``target_frac`` is the single percentage→fraction conversion (gotcha
     #14) done once at wiring. ``models`` is the explicit mnemonic tuple
     (empty = auto-adopt from ``/v1/models``). ``capacity_unavailable`` is
-    the per-backend alert flag flipped by the poller's
-    ``capacity_unavailable`` callback (decision 18). ``anchor_seq`` is the
+    the per-backend alert flag set (``True``) and cleared (``False``) by the
+    poller's ``capacity_unavailable`` callback on a state change (either
+    direction, decision 18) — it reflects the current capacity state, not a
+    sticky one-way ratchet. ``anchor_seq`` is the
     per-backend monotonic anchor sequence, incremented by the poller's
     ``on_reanchor`` callback on every re-anchor — the failover
     charge-rollback guard (decision 12) compares it to decide whether a
@@ -233,16 +235,21 @@ class RoutingState:
         self._rr[model] = (self._rr.get(model, 0) + 1) % n
 
 
-def _capacity_flag_setter(bs: BackendState) -> Callable[[], None]:
-    """A zero-arg callback that flips one backend's capacity alert flag.
+def _capacity_flag_setter(bs: BackendState) -> Callable[[bool], None]:
+    """A callback that sets or clears one backend's capacity alert flag.
 
-    The poller invokes it when an observed (HTTP 200) ``/metrics`` body
-    lacks a usable KV-cache capacity (decision 18). One closure is created
-    per backend so the flag set is the right backend's.
+    The poller invokes it with the new capacity state on a state change
+    (either direction, decision 18): ``True`` when an observed (HTTP 200)
+    ``/metrics`` body lacks a usable KV-cache capacity (set the flag) and
+    ``False`` when a later observed body provides capacity again (clear it).
+    The flag is therefore not a sticky one-way ratchet — it reflects the
+    current capacity state, so the ``gate_backend_capacity_unavailable``
+    gauge returns to 0 on recovery. One closure is created per backend so
+    the flag set is the right backend's.
     """
 
-    def _set() -> None:
-        bs.capacity_unavailable = True
+    def _set(unavailable: bool) -> None:
+        bs.capacity_unavailable = unavailable
 
     return _set
 

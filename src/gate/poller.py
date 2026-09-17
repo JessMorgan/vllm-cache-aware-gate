@@ -75,9 +75,12 @@ anchor the counter. This is NO LONGER fatal: the poller logs an error,
 **unanchors the counter** — a previously anchored counter is reset to the
 never-anchored state so the backend's autoconfig layer fails open instead of
 deciding off a stale anchor — and invokes the ``capacity_unavailable``
-callback (idempotent by design — the app wires it to flip its per-backend
-alert flag, surfaced by the ``gate_backend_capacity_unavailable`` gauge). The
-loop CONTINUES; the ONLY way the task ends is cancellation.
+callback with the NEW capacity state (``True`` when the observed body lacks
+capacity, ``False`` when it provides it), **state-change only** (either
+direction), so the app's per-backend alert flag (surfaced by the
+``gate_backend_capacity_unavailable`` gauge) is set on the transition into
+capacity-missing and **cleared on recovery** — it is not a sticky one-way
+ratchet. The loop CONTINUES; the ONLY way the task ends is cancellation.
 
 The loop runs until the task is cancelled; cancellation is logged at debug and
 re-raised so the awaiting caller observes it.
@@ -192,7 +195,7 @@ async def run_poller(
     registry: ModelRegistry | None = None,
     backend_name: str | None = None,
     explicit_models: tuple[str, ...] | None = None,
-    capacity_unavailable: Callable[[], None] | None = None,
+    capacity_unavailable: Callable[[bool], None] | None = None,
     on_reanchor: Callable[[], None] | None = None,
     on_engine: Callable[[str], None] | None = None,
     on_metrics_unavailable: Callable[[bool], None] | None = None,
@@ -206,13 +209,22 @@ async def run_poller(
     - ``httpx.HTTPError`` (transport failure) -> log a warning and keep ALL
       state (caches and counter untouched; do NOT clear anything — fail-open
       is driven by staleness).
-     - ``sample.observed`` (HTTP 200):
-       - ``capacity_tokens is None`` -> log an error, **unanchor the counter**
-         (``counter.unanchor()`` — a previously anchored counter is reset to
-         the never-anchored state, so the autoconfig layer fails open instead
-         of deciding off a stale anchor), and invoke the
-         ``capacity_unavailable`` callback (when wired) so the app's
-         per-backend alert flag is set. **Not fatal**: the loop continues.
+      - ``sample.observed`` (HTTP 200):
+        - ``capacity_tokens is None`` -> log an error, **unanchor the counter**
+          (``counter.unanchor()`` — a previously anchored counter is reset to
+          the never-anchored state, so the autoconfig layer fails open instead
+          of deciding off a stale anchor), and — on the transition INTO
+          capacity-missing — invoke ``capacity_unavailable(True)`` (when
+          wired) so the app's per-backend alert flag is set. **Not fatal**:
+          the loop continues.
+        - ``capacity_tokens is not None`` -> on the transition OUT of
+          capacity-missing (i.e. the previous observed body lacked capacity)
+          invoke ``capacity_unavailable(False)`` (when wired) so the app's
+          per-backend alert flag is **cleared** on recovery. The callback is
+          **state-change only** (either direction), driven by a local
+          ``capacity_missing`` flag that only observed bodies update, so a
+          transport error or non-200 response never changes it (the outage is
+          already visible via ``gate_metrics_fresh``).
       - ``usage_frac is not None`` -> ``cache.update(usage_frac)``; a
         truthy ``by_model`` -> ``cache.update_by_model(by_model)``.
        - ``counter`` and ``target_frac`` and ``usage_frac`` and
@@ -301,6 +313,11 @@ async def run_poller(
     # Last computed metrics-endpoint-unavailable state (None = never
     # computed) — drives the state-change on_metrics_unavailable callback.
     unavailable: bool | None = None
+    # Last observed capacity-missing state (None = never computed) — drives
+    # the state-change capacity_unavailable callback (either direction), so
+    # the app's alert flag is set on the transition into capacity-missing and
+    # cleared on recovery. Only observed (HTTP 200) bodies update it.
+    capacity_missing: bool | None = None
     try:
         while True:
             try:
@@ -340,7 +357,16 @@ async def run_poller(
                             # any change (including to/from unknown).
                             on_engine(sample.engine)
                         last_engine = sample.engine
-                    if sample.capacity_tokens is None:
+                    new_capacity_missing = sample.capacity_tokens is None
+                    if new_capacity_missing != capacity_missing:
+                        if capacity_unavailable is not None:
+                            # State-change only (either direction), synchronous
+                            # with the tick: True on the transition into
+                            # capacity-missing (set the app's alert flag),
+                            # False on recovery (clear it).
+                            capacity_unavailable(new_capacity_missing)
+                        capacity_missing = new_capacity_missing
+                    if new_capacity_missing:
                         log.error(
                             "autoconfig requires a usable KV-cache capacity "
                             "(%s) but the observed body at %s does not "
@@ -350,8 +376,6 @@ async def run_poller(
                             _capacity_gauge_names(sample.engine),
                             url,
                         )
-                        if capacity_unavailable is not None:
-                            capacity_unavailable()
                         if counter is not None:
                             # Unanchor so a stale anchor from an earlier good
                             # poll cannot drive a real (fail-closed) decision:
