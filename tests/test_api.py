@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
+import time
 from dataclasses import replace
 
 import httpx
@@ -442,6 +444,8 @@ def test_metrics_contains_required_families() -> None:
         "gate_config_info",
         "gate_metrics_fresh",
         "gate_metrics_age_s",
+        "gate_backend_engine",
+        "gate_metrics_endpoint_unavailable",
     ):
         assert family in body
 
@@ -2120,3 +2124,241 @@ def test_shared_metrics_backend_label_and_routing_json() -> None:
     # backends_json is still present (unchanged).
     assert '"name":"qwen"' in config_labels["backends_json"]
     assert '"name":"llama"' in config_labels["backends_json"]
+
+
+# --- SGLang backends (docs/plans/sglang-backend.md §4) ------------------------
+#
+# A backend may be a vLLM or an SGLang server; the engine is auto-detected
+# from the /metrics body (no config change). The app's per-backend state
+# carries the detected engine (``BackendState.engine``) and the
+# reachable-but-unrecognizable flag (``BackendState.metrics_unavailable``),
+# surfaced on each /metrics render as ``gate_backend_engine{backend,engine}``
+# and ``gate_metrics_endpoint_unavailable{backend}``.
+
+
+# A legacy SGLang /metrics body: the legacy usage gauge (sglang:token_usage)
+# with a model_name label, plus the legacy capacity gauge
+# (sglang:max_total_num_tokens).
+SGLANG_LEGACY_METRICS = (
+    "# HELP sglang:token_usage Fraction of tokens in use (legacy).\n"
+    "# TYPE sglang:token_usage gauge\n"
+    'sglang:token_usage{model_name="llama-70b"} 0.5\n'
+    "# HELP sglang:max_total_num_tokens Max total num tokens (legacy).\n"
+    "# TYPE sglang:max_total_num_tokens gauge\n"
+    "sglang:max_total_num_tokens 100000\n"
+)
+
+# A newer SGLang /metrics body: the newer usage gauge
+# (sglang:kv_cache_usage_perc) with a model_name label, plus the newer
+# capacity gauge (sglang:kv_cache_total_tokens).
+SGLANG_NEW_METRICS = (
+    "# HELP sglang:kv_cache_usage_perc Fraction of KV cache in use.\n"
+    "# TYPE sglang:kv_cache_usage_perc gauge\n"
+    'sglang:kv_cache_usage_perc{model_name="llama-70b"} 0.5\n'
+    "# HELP sglang:kv_cache_total_tokens KV cache total tokens.\n"
+    "# TYPE sglang:kv_cache_total_tokens gauge\n"
+    "sglang:kv_cache_total_tokens 100000\n"
+)
+
+
+def test_sglang_end_to_end_single_backend() -> None:
+    """A fake SGLang backend (legacy metrics body) forwards, populates the
+    per-model usage gauge by the body's ``model_name``, and renders the two
+    new gauges (engine=sglang, metrics-endpoint-available). Poller off: the
+    cache/capacity/counter are populated manually and the engine is set
+    directly on the backend state (the poller's on_engine closure would set
+    it in production)."""
+    fake = FakeVLLM()
+    fake.metrics_text = SGLANG_LEGACY_METRICS
+    cache = MetricsCache()
+    cache.update(0.10)  # low usage -> below all tiers
+    cache.update_by_model({"llama-70b": 0.5})
+    counter = KvRemaining()
+    counter.reanchor(50000)
+    capacity = CapacityCache()
+    capacity.update(100000)
+    with build_app(make_config(), cache, fake, counter=counter, capacity_cache=capacity) as client:
+        client.app.state.backends[0].engine = "sglang"
+        body = chat_body(100)
+        resp = client.post("/v1/chat/completions", content=body, headers=JSON_HEADERS)
+        assert resp.status_code == 200  # forwarded
+        assert len(fake.requests) == 1
+        assert client.get("/healthz").status_code == 200
+        metrics_body = client.get("/metrics").text
+    # The per-model usage gauge reflects the SGLang body's model_name.
+    assert 'gate_kv_cache_usage_pct{model_name="llama-70b"} 50.0' in metrics_body
+    # The two new gauges: engine=sglang (the other two engines 0), and the
+    # metrics endpoint is available (0).
+    assert 'gate_backend_engine{backend="vllm",engine="sglang"} 1.0' in metrics_body
+    assert 'gate_backend_engine{backend="vllm",engine="vllm"} 0.0' in metrics_body
+    assert 'gate_backend_engine{backend="vllm",engine="unknown"} 0.0' in metrics_body
+    assert 'gate_metrics_endpoint_unavailable{backend="vllm"} 0.0' in metrics_body
+
+
+def test_sglang_mixed_fleet_independent_admission() -> None:
+    """A mixed vLLM + SGLang fleet: each backend's admission uses ITS OWN
+    state (the SGLang backend's full pool 429s while the vLLM backend's empty
+    pool forwards), and the per-backend engine gauges reflect each backend's
+    detected engine."""
+    fakes = {
+        "a": MultiFakeVLLM("a", ("qwen3-32b",), _metrics_body(0.10)),
+        "b": MultiFakeVLLM("b", ("llama-70b",), SGLANG_NEW_METRICS),
+    }
+    cfg = multi_config()
+    cache_a = MetricsCache()
+    cache_a.update(0.10)  # vLLM backend (qwen): low usage -> empty pool
+    cache_b = MetricsCache()
+    cache_b.update(0.90)  # SGLang backend (llama): high usage -> full pool (80-tier)
+    counter_a = KvRemaining()
+    counter_a.reanchor(50000)  # vLLM: plenty of headroom
+    counter_b = KvRemaining()
+    counter_b.reanchor(100)  # SGLang: tiny headroom
+    with build_multi_app(
+        cfg,
+        fakes,
+        cache_a=cache_a,
+        cache_b=cache_b,
+        counter_a=counter_a,
+        counter_b=counter_b,
+        registry=_populated_registry(),
+    ) as client:
+        client.app.state.backends[0].engine = "vllm"  # qwen
+        client.app.state.backends[1].engine = "sglang"  # llama
+        # SGLang model (llama-70b): full pool -> 429.
+        sglang_body = json.dumps(
+            {"model": "llama-70b", "messages": [{"role": "user", "content": "a" * 5000}]}
+        ).encode()
+        rej = client.post("/v1/chat/completions", content=sglang_body, headers=JSON_HEADERS)
+        # vLLM model (qwen3-32b): empty pool -> forwards.
+        vllm_body = json.dumps(
+            {"model": "qwen3-32b", "messages": [{"role": "user", "content": "a" * 100}]}
+        ).encode()
+        ok = client.post("/v1/chat/completions", content=vllm_body, headers=JSON_HEADERS)
+        metrics_body = client.get("/metrics").text
+    assert rej.status_code == 429  # SGLang pool full
+    assert ok.status_code == 200  # vLLM pool empty
+    assert len(fakes["b"].requests) == 0
+    assert len(fakes["a"].requests) == 1
+    # Per-backend engine gauges (each backend's detected engine).
+    assert 'gate_backend_engine{backend="qwen",engine="vllm"} 1.0' in metrics_body
+    assert 'gate_backend_engine{backend="llama",engine="sglang"} 1.0' in metrics_body
+
+
+class FakeSGLangNoMetrics:
+    """A fake backend whose ``/metrics`` 404s (SGLang launched without
+    ``--enable-metrics``); the generation endpoints and ``/v1/models`` answer
+    200. The poller therefore never updates the cache (fail-open via
+    staleness) and the backend still forwards."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/metrics":
+            return httpx.Response(404)
+        if path in ("/v1/chat/completions", "/v1/completions"):
+            self.requests.append({"path": path, "body": request.content})
+            return httpx.Response(
+                200, json={"id": "x", "choices": [{"message": {"content": "hi"}}]}
+            )
+        if path == "/v1/models":
+            return httpx.Response(200, text=_models_body("m"))
+        return httpx.Response(404)
+
+
+class FakeSGLang:
+    """A fake SGLang backend whose ``/metrics`` 200s with a SGLang body (the
+    poller detects the engine and fires ``on_engine``); the generation
+    endpoints and ``/v1/models`` also answer 200. Unlike the poller-off tests,
+    the engine is set by the poller's real ``on_engine`` callback, not by
+    directly assigning ``bs.engine``."""
+
+    def __init__(self, metrics_text: str) -> None:
+        self.metrics_text = metrics_text
+        self.requests: list[dict] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/metrics":
+            return httpx.Response(200, text=self.metrics_text)
+        if path in ("/v1/chat/completions", "/v1/completions"):
+            self.requests.append({"path": path, "body": request.content})
+            return httpx.Response(
+                200, json={"id": "x", "choices": [{"message": {"content": "hi"}}]}
+            )
+        if path == "/v1/models":
+            return httpx.Response(200, text=_models_body("m"))
+        return httpx.Response(404)
+
+
+def test_sglang_with_metrics_poller_on_sets_engine_via_on_engine() -> None:
+    """A backend whose /metrics 200s with a SGLang body (poller ON): the
+    poller's real ``on_engine`` callback records the detected engine, so the
+    engine gauge shows ``sglang=1`` and the metrics-endpoint gauge shows 0
+    (a real engine was detected). This exercises the ``on_engine`` wiring
+    end-to-end (the poller-off tests set ``bs.engine`` directly)."""
+    fake = FakeSGLang(SGLANG_LEGACY_METRICS)
+    cfg = replace(make_config(), metrics_poll_interval_s=0.01)
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+    app = create_app(cfg, upstream=upstream, start_poller=True)
+    with TestClient(app) as client:
+        # Let the poller run a few ticks (interval 0.01s) so it observes the
+        # 200 SGLang body and fires on_engine("sglang") + on_metrics_unavailable(False).
+        time.sleep(0.05)
+        # The backend forwards (the poller re-anchors the counter from the
+        # SGLang body's usage + capacity; a small prompt is within headroom).
+        resp = client.post("/v1/chat/completions", content=chat_body(100), headers=JSON_HEADERS)
+        assert resp.status_code == 200
+        assert len(fake.requests) == 1
+        metrics_body = client.get("/metrics").text
+    # The engine gauge reflects the detected SGLang engine (set via on_engine).
+    assert 'gate_backend_engine{backend="vllm",engine="sglang"} 1.0' in metrics_body
+    assert 'gate_backend_engine{backend="vllm",engine="unknown"} 0.0' in metrics_body
+    # A real engine was detected -> the metrics endpoint is available (0).
+    assert 'gate_metrics_endpoint_unavailable{backend="vllm"} 0.0' in metrics_body
+
+
+def test_sglang_without_metrics_poller_on(caplog: pytest.LogCaptureFixture) -> None:
+    """A backend whose /metrics 404s (poller ON): the poller sets the
+    reachable-but-unrecognizable flag (gate_metrics_endpoint_unavailable=1),
+    the engine stays unknown (gate_backend_engine{...,unknown}=1), the
+    backend still forwards (fail-open), and the --enable-metrics warning is
+    logged once per transition (not repeated per tick)."""
+    fake = FakeSGLangNoMetrics()
+    cfg = replace(make_config(), metrics_poll_interval_s=0.01)
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+    app = create_app(cfg, upstream=upstream, start_poller=True)
+    caplog.set_level(logging.WARNING, logger="gate.poller")
+    with TestClient(app) as client:
+        # Let the poller run a few ticks (interval 0.01s) so it observes the
+        # 404 and transitions into the unavailable state.
+        time.sleep(0.05)
+        # The backend still forwards (fail-open — the cache is never fetched).
+        resp = client.post("/v1/chat/completions", content=chat_body(100), headers=JSON_HEADERS)
+        assert resp.status_code == 200
+        assert len(fake.requests) == 1
+        metrics_body = client.get("/metrics").text
+    # The two new gauges: endpoint unavailable (1), engine unknown (1).
+    assert 'gate_metrics_endpoint_unavailable{backend="vllm"} 1.0' in metrics_body
+    assert 'gate_backend_engine{backend="vllm",engine="unknown"} 1.0' in metrics_body
+    # The --enable-metrics warning is logged ONCE (per transition), not once
+    # per tick: a 404 every tick does not re-fire the warning.
+    enable_metrics_warnings = [
+        r for r in caplog.records if r.name == "gate.poller" and "--enable-metrics" in r.message
+    ]
+    assert len(enable_metrics_warnings) == 1
+
+
+def test_metrics_engine_and_unavailable_default_values() -> None:
+    """The default single-backend vLLM app (poller off) renders the engine
+    gauge with engine=unknown (the default) and the metrics-endpoint gauge at
+    0 (the default)."""
+    fake = FakeVLLM()
+    cache = MetricsCache()
+    with build_app(make_config(), cache, fake) as client:
+        body = client.get("/metrics").text
+    assert 'gate_backend_engine{backend="vllm",engine="unknown"} 1.0' in body
+    assert 'gate_backend_engine{backend="vllm",engine="vllm"} 0.0' in body
+    assert 'gate_backend_engine{backend="vllm",engine="sglang"} 0.0' in body
+    assert 'gate_metrics_endpoint_unavailable{backend="vllm"} 0.0' in body

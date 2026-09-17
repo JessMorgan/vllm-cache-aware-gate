@@ -49,6 +49,12 @@ services:
       # Duplicate model ids across backends are legal (see the note above);
       # their routing is configured in the file-only `routing:` section.
       BACKENDS_JSON: '[{"name":"qwen","host":"vllm","port":8000,"default":true}]'
+      # SGLang backends work too: a backend's `host`/`port` may point at an
+      # SGLang server (the engine is auto-detected from its /metrics body; no
+      # engine config key) — run sglang with --enable-metrics. E.g. an SGLang
+      # backend alongside the vLLM one:
+      # BACKENDS_JSON: '[{"name":"qwen","host":"vllm","port":8000,"default":true},
+      #                  {"name":"llama","host":"sglang","port":8001}]'
       # Optional tiered policy (autoconfig is always on regardless). Omit for
       # an autoconfig-only run.
       THRESHOLDS_JSON: '[{"kv_pct":50,"max_context":4096,"timeout_s":15},{"kv_pct":80,"max_context":1024,"timeout_s":30}]'

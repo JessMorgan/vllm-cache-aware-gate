@@ -26,6 +26,11 @@
 # At most one backend may be `default: true` (the fallback for unknown
 # models; the first backend when none is flagged). All per-backend knobs are
 # optional and default to the global values below.
+# An entry's `host`/`port` may point at a vLLM OR an SGLang server — the
+# engine is auto-detected from the backend's /metrics body (there is no
+# engine config key). SGLang must be launched with --enable-metrics or it
+# does not serve /metrics (the backend then fails open — see the README
+# "SGLang backends" section).
 backends:
   - name: qwen
     host: vllm-qwen

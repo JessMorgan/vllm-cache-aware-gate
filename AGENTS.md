@@ -96,16 +96,32 @@ FastAPI app wires together.
    candidate backends via the `ModelRegistry`'s
    `resolve_candidates`; `"unknown"` falls to the default backend) and the
    stats `model` label.
-- **`src/gate/metrics.py`** — `parse_kv_cache_usage(text) -> float | None`
-  (max across all `vllm:kv_cache_usage_perc` series),
-  `parse_kv_cache_usage_by_model(text) -> dict[str, float] | None` (per-model
-  fractions keyed by `model_name`, `"default"` when unlabeled),
-  `parse_kv_cache_capacity(text) -> int | None` (max positive
-  `vllm:kv_cache_size_tokens` gauge sample, falling back to the
+- **`src/gate/metrics.py`** — engine-agnostic `/metrics` parsing (vLLM or
+  SGLang, detected per body — `docs/plans/sglang-backend.md`). Carries the
+  engine constants (`ENGINE_VLLM` / `ENGINE_SGLANG` / `ENGINE_UNKNOWN` +
+  `ENGINES`), `detect_engine(text) -> str` (pure; probes the **usage-gauge
+  families by name presence** in the fixed precedence
+  `vllm:kv_cache_usage_perc` → `sglang:kv_cache_usage_perc` →
+  `sglang:token_usage` → `unknown`), the `MetricsParser` protocol (three pure
+  methods: `usage` / `usage_by_model` / `capacity`) with three implementations
+  — `VllmMetricsParser` (the original vLLM logic verbatim),
+  `SglangMetricsParser` (newer gauge with a legacy fallback:
+  `sglang:kv_cache_usage_perc` over `sglang:token_usage`,
+  `sglang:kv_cache_total_tokens` over `sglang:max_total_num_tokens`; the newer
+  one wins when present), and `UnknownMetricsParser` (all-`None` no-op) — plus
+  the `_PARSERS` registry (engine → parser). The three
+  `parse_kv_cache_*` free functions are retained as **thin vLLM facades** over
+  `VllmMetricsParser` (max across all `vllm:kv_cache_usage_perc` series;
+  per-model fractions keyed by `model_name`, `"default"` when unlabeled; max
+  positive `vllm:kv_cache_size_tokens` gauge sample falling back to the
   `kv_cache_size_tokens` label on `vllm:cache_config_info` — the form current
-  vLLM emits), and `fetch_metrics(client, url) ->
-  MetricsSample` (a single GET that parses usage + by-model + capacity from one
-  body). `MetricsCache` (last value + `fetched_at` + `age()`; `by_model()`
+  vLLM emits); `fetch_usage` / `fetch_usage_by_model` are **gone** (folded into
+  `fetch_metrics`). `fetch_metrics(client, url) ->
+  MetricsSample` — a single GET that detects the engine and parses usage +
+  by-model + capacity from one body; `MetricsSample` carries
+  **`engine: str`** (`"vllm"` / `"sglang"` / `"unknown"`; non-200 →
+  `engine="unknown"`). `MetricsCache` (last value + `fetched_at` + `age()`;
+  `by_model()`
   stores the per-model breakdown while `_value` stays the MAX of it),
    `CapacityCache` (last good capacity token count; never stale, only unknown),
    and `KvRemaining` — the in-memory estimated-remaining-KV counter
@@ -113,11 +129,12 @@ FastAPI app wires together.
     never anchored, `add(tokens)` re-adds — the **inverse of `subtract`**, the
     failover charge-rollback primitive, same no-op-when-unanchored contract,
     `value()` returns `int | None`). All three are **reused once
-    per backend** by the app (`BackendState`); the parse functions are shared
-    across backends.
+    per backend** by the app (`BackendState`); the parsers are shared across
+    backends.
 - **`src/gate/poller.py`** — `run_poller(client, cache, url, interval_s, *,
   counter, target_frac, capacity_cache, model_url, model_refresh_s, registry,
   backend_name, explicit_models, capacity_unavailable, on_reanchor,
+  on_engine, on_metrics_unavailable,
   routing_order)`: **one instance per
   backend** (the app's lifespan starts one task per configured backend). Each
   tick makes ONE `GET` via `fetch_metrics` and, on an observed (HTTP 200) body,
@@ -128,9 +145,26 @@ FastAPI app wires together.
   wires it to increment the backend's monotonic `anchor_seq` (the failover
   charge-rollback guard). **Fails open** on any
   transport error / non-200 (keeps ALL state — caches and counter — no crash).
-  **Capacity-missing is per-backend fail-open (no exit):** an observed body
-  missing a usable KV-cache capacity (the `vllm:kv_cache_size_tokens` gauge or
-  the `kv_cache_size_tokens` label on `vllm:cache_config_info`) logs an error,
+  **Engine callbacks (state-change only, synchronous, logged-not-fatal):**
+  `on_engine(engine)` fires when the detected engine **changes** (first
+  detection included, and a change to or from `unknown`); the poller keeps a
+  local `last_engine` that only observed (HTTP 200) bodies update, so
+  transport errors and non-200 responses never change it.
+  `on_metrics_unavailable(state)` fires with the **new state** whenever the
+  *unavailable* state changes (either direction): `True` for a non-200
+  response or a 200 body detected `unknown`, `False` for a 200 body detected
+  `vllm`/`sglang`; a **pure transport error leaves the state unchanged**
+  (the outage is already visible via `gate_metrics_fresh`). On a transition
+  **into** unavailable the poller additionally logs the `--enable-metrics`
+  WARNING **once** (SGLang only serves `/metrics` when launched with
+  `--enable-metrics`); on recovery nothing is logged. **Capacity-missing is
+  per-backend fail-open (no exit):** an observed body missing a usable
+  KV-cache capacity (the *detected engine's* capacity gauges — the
+  `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
+  `vllm:cache_config_info` for vLLM;
+  `sglang:kv_cache_total_tokens` / `sglang:max_total_num_tokens` for SGLang;
+  "no recognizable KV-cache capacity" for `unknown` — `_capacity_gauge_names`
+  makes the error message **engine-aware**) logs an error,
   leaves that backend's counter unanchored (its autoconfig layer fails open),
   and invokes the `capacity_unavailable` callback (surfaced by the
   `gate_backend_capacity_unavailable{backend}` gauge); the loop keeps running.
@@ -221,9 +255,17 @@ FastAPI app wires together.
     the app unions all backends' by-model maps, max on key collisions),
     `set_freshness(backend, fresh, age_s)`, `set_remaining(backend, int | None)`
     (the `gate_kv_cache_remaining_tokens{backend}` gauge — the gate's own live
-    estimate of remaining KV tokens; `None` renders `NaN`), and
+    estimate of remaining KV tokens; `None` renders `NaN`),
     `set_backend_capacity_unavailable(backend, bool)` (the
-    `gate_backend_capacity_unavailable{backend}` 0/1 alert gauge).
+    `gate_backend_capacity_unavailable{backend}` 0/1 alert gauge),
+    `set_backend_engine(backend, engine)` (the
+    `gate_backend_engine{backend,engine}` gauge — `1` for the currently
+    detected engine (`engine` ∈ `vllm` | `sglang` | `unknown`), `0` for the
+    other two, `unknown=1` initially — set for every backend on each
+    `/metrics` render), and `set_backend_metrics_unavailable(backend, bool)`
+    (the `gate_metrics_endpoint_unavailable{backend}` 0/1 alert gauge — `1`
+    while the backend's `/metrics` is reachable-but-unrecognizable, `0` once
+    a real engine is detected).
     `gate_config_info` serializes the backend structure (`backends_json`:
     name/host/port/default + which knobs are overridden) **and** the `routing:`
     section (`routing_json`: `[[model, policy, [order...]], ...]`, `[]` when
@@ -233,10 +275,21 @@ FastAPI app wires together.
   (`POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`,
   `GET /healthz`, `GET /metrics`), the 429/502 builders, and the wiring of the
   per-backend pollers + caches + proxy + stats (each decision is recorded as a
-  pure side effect; `/metrics` renders the stats and always returns 200). Owns
+  pure side effect; `/metrics` renders the stats — including the two lines
+  `stats.set_backend_engine(bs.name, bs.engine)` and
+  `stats.set_backend_metrics_unavailable(bs.name, bs.metrics_unavailable)`
+  per backend — and always returns 200). Owns
   one `BackendState` per configured backend (`MetricsCache`, `CapacityCache`,
   `KvRemaining`, resolved thresholds/autoconfig policy/target_frac, `base_url`,
-  the per-backend `capacity_unavailable` flag, and the per-backend monotonic
+  the per-backend `capacity_unavailable` flag, **`engine`** (currently
+  detected engine, `ENGINE_UNKNOWN` until first detection) and
+  **`metrics_unavailable`** (the per-backend reachable-but-unrecognizable
+  flag, `False` initially) — the latter two set by the app's
+  `_on_engine_setter` / `_metrics_unavailable_setter` closures, which the
+  lifespan wires to the poller's `on_engine` / `on_metrics_unavailable`
+  callbacks; the flag's `False` recovery transition rides the
+  `on_metrics_unavailable` callback, **not** the engine setter — and the
+  per-backend monotonic
   `anchor_seq` — incremented by the poller's `on_reanchor` callback; the
   failover charge-rollback guard), the per-model `RoutingState` (stateful
   per-model `round_robin` index — advances only on a successful forward), the
@@ -296,7 +349,15 @@ FastAPI app wires together.
   started by the app lifespan, not here), and run uvicorn (the config's
   `log_level`, lowercased, is passed as `log_level=`). There is **no CLI** —
   argv is ignored (autoconfig is always on).
-- **`tests/`** — `test_tokens.py`, `test_router.py`, `test_metrics.py`,
+- **`tests/`** — `test_tokens.py`, `test_router.py`, `test_metrics.py`
+  (incl. `detect_engine` per the fixed precedence by family-name presence —
+  vllm / sglang-new / sglang-legacy / both-sglang → sglang /
+  capacity-without-usage → unknown / unparseable → unknown / **all-NaN vLLM
+  usage → vllm** / vLLM-wins-when-all-three-families-present; the per-engine
+  `usage` / `usage_by_model` / `capacity` parsers incl. the new→legacy SGLang
+  fallbacks, `None`-not-`{}` by-model, the byte-identity edge — all-NaN vLLM
+  usage + valid vLLM capacity → `engine="vllm"` with `capacity` parsed; and
+  `fetch_metrics` end-to-end per engine),
   `test_models.py` (parse + registry, incl. `resolve_candidates`: single-owner
   1-tuple, multi-owner ordered tuple, removal), `test_routing.py` (pure
   `select_backend` per policy — RR/PF = 0 at selection, `large_small`
@@ -308,11 +369,19 @@ FastAPI app wires together.
   `large_small`; `log_level` file/env parse + validation; duplicate model
   ids across backends **now legal**),
   `test_stats.py`,
-  `test_api.py` (ASGI end-to-end with fake vLLMs — multi-backend routing,
-  per-policy routing, pre-stream failover + charge rollback, exhaustion
-  429-max / 502 / last-5xx-propagated, `/v1/models` duplicate `owned_by`,
-  per-backend + per-model `routing` in `/healthz`, the `backend` label and
-  `gate_routing_failovers_total`), `test_poller.py`, `test_main.py`.
+  `test_api.py` (ASGI end-to-end with fake vLLMs **and a fake SGLang** —
+  multi-backend routing, per-policy routing, pre-stream failover + charge
+  rollback, exhaustion 429-max / 502 / last-5xx-propagated, `/v1/models`
+  duplicate `owned_by`, per-backend + per-model `routing` in `/healthz`, the
+  `backend` label and `gate_routing_failovers_total`; plus SGLang coverage:
+  a legacy-SGLang backend end-to-end (engine gauge
+  `gate_backend_engine{...,sglang}=1`, `gate_metrics_endpoint_unavailable=0`),
+  a mixed vLLM+SGLang fleet with independent per-backend admission, and a
+  SGLang-without-metrics backend (gauge `=1`, engine `unknown`, the
+  `--enable-metrics` warning logged once)), `test_poller.py` (incl. the
+  `on_engine` / `on_metrics_unavailable` state-change semantics and the
+  engine-aware capacity-missing message), `test_stats.py` (incl. the two new
+  per-backend engine gauges), `test_main.py`.
 - **`Dockerfile`**, **`docker-compose.example.yaml`**, **`config.example.yaml`**,
   **`Makefile`**, **`README.md`** — packaging, operator reference, and docs.
 
@@ -358,11 +427,12 @@ mean a green CI run; the container job is skipped (with a warning) when
 docker is absent.
 
 The `tests/test_api.py` suite drives the gate end-to-end against fake vLLMs
-(`httpx.ASGITransport` + a mock upstream transport — including multi-backend
-routing, per-policy routing, and pre-stream failover cases), so the allow /
-429 / fail-open / streaming / routing / failover paths are all exercised
-without a real model; `tests/test_routing.py` unit-tests the pure
-`select_backend` selection for all five policies.
+**and a fake SGLang** (`httpx.ASGITransport` + a mock upstream transport —
+including multi-backend routing, per-policy routing, pre-stream failover, and
+the SGLang cases), so the allow / 429 / fail-open / streaming / routing /
+failover paths are all exercised without a real model;
+`tests/test_routing.py` unit-tests the pure `select_backend` selection for
+all five policies.
 
 ## Working copies: always work in a worktree, never in the main checkout
 
@@ -926,6 +996,38 @@ proxy, not an inference engine.
     "hot primary, backups"); do not collapse them. (`app.py`, `routing.py`,
     `stats.py`)
 
+22. **Engine-specific metric families are detected per body — there is NO
+    config knob.** A backend may be a **vLLM or an SGLang** server; the engine
+    is **auto-detected from each observed `/metrics` body** by
+    `detect_engine` (the single source of truth) in the fixed precedence
+    **vLLM → newer SGLang → older SGLang → unknown** (`vllm:kv_cache_usage_perc`
+    → `sglang:kv_cache_usage_perc` → `sglang:token_usage` → `unknown`).
+    Detection is by **usage-gauge FAMILY-NAME PRESENCE, not sample
+    finiteness** — a body whose `vllm:kv_cache_usage_perc` is **all-NaN** (but
+    still parses) must still detect as **`vllm`** (the all-NaN case is a real
+    input — `tests/test_metrics.py` has a `NAN_ONLY` vector); finiteness is
+    the parser's concern (`_finite_samples`), not detection's. `config.py` is
+    unchanged — there is no `engine`/`kind` key and no env var. **`unknown`
+    and transport failures fail open:** a body with no recognizable KV usage
+    gauge (e.g. SGLang launched without `--enable-metrics`, or some other
+    OpenAI-compatible server) detects `unknown` — its `UnknownMetricsParser`
+    returns all `None`, so the backend never anchors and fails open via
+    staleness (gotcha #1); it is surfaced (not silent) by
+    `gate_metrics_endpoint_unavailable{backend}` (set to 1) +
+    `gate_backend_engine{...,engine="unknown"}` (= 1) and a logged
+    `--enable-metrics` WARNING once per transition into the unavailable state.
+    The per-model **`model_name` label is shared across engines** (same label
+    name and `"default"`-when-unlabeled semantics in both), so the per-model
+    breakdown and the `gate_kv_cache_usage_pct` union are engine-agnostic.
+    **vLLM behavior is byte-identical** (decision 10): `VllmMetricsParser` is
+    the original logic verbatim and the existing `test_metrics.py` vectors are
+    the contract — a vLLM body detects `vllm` and yields exactly the values it
+    yields today (the all-NaN usage + valid capacity body must NOT take the
+    capacity-missing path). Future engines are additive: a new
+    `MetricsParser` implementation + a `detect_engine` probe + a `_PARSERS`
+    registry entry (touches no shared control flow; only adds a label value to
+    `gate_backend_engine`). (`metrics.py`, `poller.py`, `app.py`, `stats.py`)
+
 ## Authoritative docs (read on demand)
 
 - `README.md` — quickstart, config reference, decision logic, 429 contract,
@@ -941,6 +1043,13 @@ proxy, not an inference engine.
   routing, `backends:` replacing `vllm_host`/`vllm_port`, capacity-missing
   per-backend fail-open), the config schema, model discovery, and the
   per-backend observability changes.
+- `docs/plans/sglang-backend.md` — the SGLang backend support design plan:
+  engine auto-detection from the `/metrics` body (fixed precedence, by
+  family-name presence), the `MetricsParser` interface + per-engine
+  implementations, the new→legacy SGLang gauge fallbacks, the two new
+  per-backend gauges (`gate_backend_engine`,
+  `gate_metrics_endpoint_unavailable`) and the `--enable-metrics` warning,
+  and the byte-identical-vLLM invariant.
 - `config.example.yaml` — the reference configuration with the `backends`
   entry contract (global defaults + per-backend overrides) and the
   `thresholds` entry contract.

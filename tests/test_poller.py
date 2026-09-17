@@ -52,6 +52,36 @@ METRICS_MODEL_A_055 = (
 #: Capacity gauge present, usage gauge absent.
 METRICS_CAPACITY_ONLY = CAPACITY_BLOCK
 
+#: SGLang (legacy) body: usage from ``sglang:token_usage``, capacity from
+#: ``sglang:max_total_num_tokens``.
+SGLANG_LEGACY = (
+    "# HELP sglang:token_usage Fraction of tokens in use.\n"
+    "# TYPE sglang:token_usage gauge\n"
+    "sglang:token_usage 0.55\n"
+    "# HELP sglang:max_total_num_tokens Total token capacity.\n"
+    "# TYPE sglang:max_total_num_tokens gauge\n"
+    "sglang:max_total_num_tokens 100000\n"
+)
+
+#: SGLang (newer) body: usage from ``sglang:kv_cache_usage_perc``, capacity
+#: from ``sglang:kv_cache_total_tokens``.
+SGLANG_NEW = (
+    "# HELP sglang:kv_cache_usage_perc Fraction of KV cache in use.\n"
+    "# TYPE sglang:kv_cache_usage_perc gauge\n"
+    "sglang:kv_cache_usage_perc 0.55\n"
+    "# HELP sglang:kv_cache_total_tokens Total KV cache capacity in tokens.\n"
+    "# TYPE sglang:kv_cache_total_tokens gauge\n"
+    "sglang:kv_cache_total_tokens 100000\n"
+)
+
+#: SGLang usage-only body (no capacity gauge) — the engine-aware
+#: capacity-missing fixture.
+SGLANG_USAGE_ONLY = (
+    "# HELP sglang:token_usage Fraction of tokens in use.\n"
+    "# TYPE sglang:token_usage gauge\n"
+    "sglang:token_usage 0.55\n"
+)
+
 MODELS_BODY = json.dumps({"data": [{"id": "m1"}, {"id": "m2"}]})
 
 
@@ -290,8 +320,17 @@ async def test_good_poll_reanchors_counter_and_updates_caches() -> None:
             await task
 
 
-async def test_capacity_without_usage_no_reanchor_no_raise() -> None:
-    """Capacity present but usage absent: no reanchor, no raise; capacity cached."""
+async def test_capacity_only_no_usage_detects_unknown_unanchors() -> None:
+    """A capacity-only body (no usage gauge) now detects as ``unknown``.
+
+    With engine auto-detection (docs/plans/sglang-backend.md decision 2), a
+    body that has a capacity gauge but no usage gauge is classified
+    ``unknown`` (detection is usage-gauge-only), so the ``UnknownMetricsParser``
+    yields ``capacity_tokens=None`` and the poller takes the capacity-missing
+    path: it unanchors the counter and leaves the capacity cache empty. This
+    is the documented "detection is usage-gauge-only" consequence (the plan's
+    Known risks) — such a backend never anchors. No raise; the loop continues.
+    """
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, text=METRICS_CAPACITY_ONLY))
     async with httpx.AsyncClient(transport=transport) as client:
         cache = MetricsCache()
@@ -310,9 +349,9 @@ async def test_capacity_without_usage_no_reanchor_no_raise() -> None:
             )
         )
         await asyncio.sleep(0.05)
-        assert counter.value() == 1000  # last anchor persists
+        assert counter.value() is None  # unanchored (capacity-missing path)
         assert cache.value() is None  # no usage to store
-        assert capacity_cache.value() == 100000
+        assert capacity_cache.value() is None  # unknown parser yields no capacity
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -471,6 +510,404 @@ async def test_on_reanchor_fires_synchronously_with_reanchor() -> None:
         await asyncio.sleep(0.05)  # several re-anchoring ticks
         assert len(observed) >= 3
         assert all(v == expected for v in observed)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+# ---------------------------------------------------------------------------
+# engine callbacks (on_engine / on_metrics_unavailable)
+# ---------------------------------------------------------------------------
+
+
+async def test_on_engine_fires_on_first_detection_only() -> None:
+    """``on_engine`` fires with the detected engine exactly once (first tick).
+
+    A poller against a fake SGLang (legacy) body: the callback is called with
+    ``"sglang"`` on the first observed tick and NOT again on repeat ticks with
+    the same engine.
+    """
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, text=SGLANG_LEGACY))
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[str] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_engine=lambda e: calls.append(e),
+            )
+        )
+        await asyncio.sleep(0.05)  # several ticks, all the same engine
+        assert calls == ["sglang"]  # first detection only — not every tick
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_engine_fires_on_engine_change() -> None:
+    """A body that CHANGES engine (vllm -> sglang) fires the callback once.
+
+    The mutable body flips from a vLLM body to an SGLang body between ticks:
+    the callback sees ``["vllm", "sglang"]`` — one call per engine value, in
+    order, no repeats.
+    """
+    body = {"text": METRICS_BOTH}  # vllm first
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body["text"])
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[str] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_engine=lambda e: calls.append(e),
+            )
+        )
+        await asyncio.sleep(0.05)  # several vllm ticks
+        assert calls == ["vllm"]
+        body["text"] = SGLANG_LEGACY  # flip: engine changes to sglang
+        await asyncio.sleep(0.05)  # several sglang ticks
+        assert calls == ["vllm", "sglang"]  # the change fired exactly once
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_engine_not_fired_on_legacy_to_new_sglang_upgrade() -> None:
+    """A legacy -> newer SGLang upgrade stays ``sglang`` at engine level.
+
+    Only the internal gauge selection changes (token_usage ->
+    kv_cache_usage_perc); the detected engine is ``sglang`` before and after,
+    so ``on_engine`` does NOT fire a second time.
+    """
+    body = {"text": SGLANG_LEGACY}
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body["text"])
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[str] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_engine=lambda e: calls.append(e),
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert calls == ["sglang"]
+        body["text"] = SGLANG_NEW  # newer gauges — same engine
+        await asyncio.sleep(0.05)
+        assert calls == ["sglang"]  # no second call: engine unchanged
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_metrics_unavailable_404_then_recovery_clears() -> None:
+    """The 404 -> healthy-vllm case: fires True on the 404, False on recovery.
+
+    This is the load-bearing recovery-clear case: the state callback fires
+    ``False`` even though the engine never changed (a non-200 sample is not
+    an engine detection, so ``on_engine`` would not have fired on recovery
+    either — the app's ``metrics_unavailable`` flag relies on THIS callback).
+    """
+    state = {"status": 404, "text": ""}  # SGLang without --enable-metrics: 404
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(state["status"], text=state["text"])
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[bool] = []
+        engine_calls: list[str] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_engine=lambda e: engine_calls.append(e),
+                on_metrics_unavailable=lambda s: calls.append(s),
+            )
+        )
+        await asyncio.sleep(0.05)  # several 404 ticks
+        assert calls == [True]  # once per transition — not every failing tick
+        assert engine_calls == []  # non-200 is not an engine detection
+        state["status"] = 200
+        state["text"] = METRICS_BOTH  # recovery: a healthy vLLM body
+        await asyncio.sleep(0.05)
+        assert calls == [True, False]  # recovery fired False once
+        assert engine_calls == ["vllm"]  # engine detected only on recovery
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_metrics_unavailable_unknown_body_then_recovery() -> None:
+    """A 200 body detecting ``unknown`` fires True; a real-engine body fires False.
+
+    Covers both degradation flavors (a 200 body with no recognizable KV
+    gauge) and the recovery direction.
+    """
+    body = {"text": "not a metrics body"}  # 200, detects unknown
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body["text"])
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[bool] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_metrics_unavailable=lambda s: calls.append(s),
+            )
+        )
+        await asyncio.sleep(0.05)  # several unknown ticks
+        assert calls == [True]  # once per transition
+        body["text"] = METRICS_BOTH  # recovery: healthy vLLM body
+        await asyncio.sleep(0.05)
+        assert calls == [True, False]  # recovery fired False once
+        body["text"] = "still not metrics"  # re-degradation after recovery
+        await asyncio.sleep(0.05)
+        assert calls == [True, False, True]  # re-armed and fired again
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_metrics_unavailable_not_fired_on_transport_error() -> None:
+    """A pure transport error does NOT change the unavailable state.
+
+    The existing ``metrics fetch failed`` warning covers a downed server; the
+    outage is already visible via ``gate_metrics_fresh``. The callback is not
+    invoked and the state is unchanged (no re-fire on the next failing tick).
+    """
+    body = {"mode": "ok"}  # start healthy (vllm)
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        if body["mode"] == "down":
+            raise httpx.ConnectError("boom", request=_req)
+        return httpx.Response(200, text=METRICS_BOTH)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[bool] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_metrics_unavailable=lambda s: calls.append(s),
+            )
+        )
+        await asyncio.sleep(0.05)  # several healthy ticks
+        assert calls == [False]  # first detection: state computed as False
+        body["mode"] = "down"  # transport errors
+        await asyncio.sleep(0.05)  # several transport-error ticks
+        assert calls == [False]  # unchanged — no callback on transport errors
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_on_metrics_unavailable_non200_then_non200_no_refire() -> None:
+    """Non-200 after non-200 does NOT re-fire the callback."""
+    body = {"status": 503}
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(body["status"], text="down")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[bool] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_metrics_unavailable=lambda s: calls.append(s),
+            )
+        )
+        await asyncio.sleep(0.05)  # several 503 ticks
+        assert calls == [True]  # once per transition, not every tick
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_metrics_unavailable_warning_logged_once_on_transition(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The --enable-metrics WARNING is logged once on the True transition.
+
+    It does NOT repeat on subsequent failing ticks, and it is logged again on
+    a new degradation after a recovery (re-armed).
+    """
+    body = {"status": 404}
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        if body["status"] == 200:
+            return httpx.Response(200, text=METRICS_BOTH)
+        return httpx.Response(body["status"], text="")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        calls: list[bool] = []
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+                on_metrics_unavailable=lambda s: calls.append(s),
+            )
+        )
+        with caplog.at_level("WARNING", logger="gate.poller"):
+            await asyncio.sleep(0.05)  # several 404 ticks
+            warnings = [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "--enable-metrics" in r.getMessage()
+            ]
+            assert len(warnings) == 1  # once per transition
+            assert "http://x/metrics" in warnings[0].getMessage()
+            # Recovery: no warning on the False transition.
+            caplog.clear()
+            body["status"] = 200
+            await asyncio.sleep(0.05)
+            assert calls == [True, False]
+            assert not [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "--enable-metrics" in r.getMessage()
+            ]
+            # Re-degradation: warned again.
+            caplog.clear()
+            body["status"] = 404
+            await asyncio.sleep(0.05)
+            assert calls == [True, False, True]
+            assert [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "--enable-metrics" in r.getMessage()
+            ]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_capacity_missing_message_is_engine_aware_sglang(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A SGLang body with usage but no capacity names the SGLang gauges.
+
+    The capacity-missing ``log.error`` is engine-aware: for a detected
+    ``sglang`` engine it names ``sglang:kv_cache_total_tokens`` and
+    ``sglang:max_total_num_tokens`` (not the vLLM gauge names).
+    """
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, text=SGLANG_USAGE_ONLY))
+    async with httpx.AsyncClient(transport=transport) as client:
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+            )
+        )
+        with caplog.at_level("ERROR", logger="gate.poller"):
+            await asyncio.sleep(0.05)  # several capacity-missing ticks
+            errors = [
+                r
+                for r in caplog.records
+                if r.levelname == "ERROR" and "autoconfig requires" in r.getMessage()
+            ]
+            assert len(errors) >= 1
+            msg = errors[0].getMessage()
+            assert "sglang:kv_cache_total_tokens" in msg
+            assert "sglang:max_total_num_tokens" in msg
+            assert "vllm:kv_cache_size_tokens" not in msg
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_capacity_missing_message_is_engine_aware_vllm(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A vLLM body with usage but no capacity keeps the vLLM gauge names."""
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, text=METRICS_055))
+    async with httpx.AsyncClient(transport=transport) as client:
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+            )
+        )
+        with caplog.at_level("ERROR", logger="gate.poller"):
+            await asyncio.sleep(0.05)
+            errors = [
+                r
+                for r in caplog.records
+                if r.levelname == "ERROR" and "autoconfig requires" in r.getMessage()
+            ]
+            assert len(errors) >= 1
+            msg = errors[0].getMessage()
+            assert "vllm:kv_cache_size_tokens" in msg
+            assert "sglang:kv_cache_total_tokens" not in msg
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_capacity_missing_message_unknown_engine(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ``unknown`` body's capacity-missing message says 'no recognizable'."""
+    body = {"text": "not a metrics body"}  # 200, detects unknown
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body["text"])
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        task = asyncio.create_task(
+            run_poller(
+                client,
+                MetricsCache(),
+                "http://x/metrics",
+                0.01,
+            )
+        )
+        with caplog.at_level("ERROR", logger="gate.poller"):
+            await asyncio.sleep(0.05)
+            errors = [
+                r
+                for r in caplog.records
+                if r.levelname == "ERROR" and "autoconfig requires" in r.getMessage()
+            ]
+            assert len(errors) >= 1
+            msg = errors[0].getMessage()
+            assert "no recognizable KV-cache capacity" in msg
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

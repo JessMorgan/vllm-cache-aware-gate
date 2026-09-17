@@ -1,8 +1,9 @@
 # vllm-cache-aware-gate
 
 A small, single-purpose **reverse-proxy "gate"** container that sits in front
-of one or more [vLLM](https://docs.vllm.ai) OpenAI-compatible backends and
-protects their KV caches from over-subscription. It speaks the OpenAI API and,
+of one or more OpenAI-compatible inference backends ([vLLM](https://docs.vllm.ai)
+or [SGLang](https://docs.sglang.ai)) and protects their KV caches from
+over-subscription. It speaks the OpenAI API and,
 per request, resolves the body's `model` to the configured backends that serve
 it (a **candidate set** — a model id may be served by more than one backend),
 picks one of them to proxy to (by a per-model **routing policy**, or the
@@ -16,20 +17,24 @@ two routes **using that backend's KV state**:
   **`HTTP 429` with a `Retry-After` header** telling it how long to wait.
 
 It learns each backend's headroom by polling that backend's Prometheus
-`/metrics` endpoint (one background poller per backend) and reading
-`vllm:kv_cache_usage_perc` (how full the cache is) and the KV-cache capacity in
-tokens — from the `vllm:kv_cache_size_tokens` gauge, or the
-`kv_cache_size_tokens` label on `vllm:cache_config_info` (the form current vLLM
-emits) — and by polling the backend's `GET /v1/models` to learn which model ids
-it serves. It is designed for **safe, configuration-first, fail-open**
-operation: a monitoring outage never blocks inference traffic, and the gate is
+`/metrics` endpoint (one background poller per backend) and reading the
+backend's KV-cache **usage fraction** and **capacity in tokens** (vLLM:
+`vllm:kv_cache_usage_perc` + the `vllm:kv_cache_size_tokens` gauge or the
+`kv_cache_size_tokens` label on `vllm:cache_config_info`; SGLang: its own
+`sglang:` gauges, new-name with a legacy fallback — see
+[SGLang backends](#sglang-backends)); it also polls the backend's
+`GET /v1/models` to learn which model ids it serves. It is designed for
+**safe, configuration-first, fail-open** operation: a monitoring outage never
+blocks inference traffic, and the gate is
 a transparent pass-through for the endpoints it proxies.
 
 > **Multi-backend / multi-model routing.** The gate now fronts **multiple**
-> vLLM backends, configured via a **required** `backends:` list. Admission
+> inference backends (vLLM or SGLang — the engine is auto-detected, see
+> [SGLang backends](#sglang-backends)), configured via a **required**
+> `backends:` list. Admission
 > state (usage feed, capacity, remaining-KV counter, poller, policy) is
-> **per backend**: models on one backend share its KV pool (single-engine
-> vLLM), so a shared-KV backend is treated the same across its models. The
+> **per backend**: models on one backend share its KV pool (one inference
+> engine), so a shared-KV backend is treated the same across its models. The
 > request body's `model` field is the **routing key** — it selects the
 > candidate backends for the request and which backend's KV state the
 > admission layers evaluate. **Model ids may be duplicated across backends**
@@ -331,9 +336,12 @@ Capacity 100 000, target 85%, margin 1.25, retry 5/60.
 
 #### Capacity-missing caveat (per-backend fail-open)
 
-- **A live vLLM backend whose `/metrics` lacks a usable KV-cache capacity**
-  (the `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
-  `vllm:cache_config_info`) cannot anchor **that backend's** counter. This is
+- **A live backend whose `/metrics` lacks a usable KV-cache capacity**
+  (the *detected engine's* capacity gauges — `vllm:kv_cache_size_tokens` / the
+  `kv_cache_size_tokens` label on `vllm:cache_config_info` for vLLM;
+  `sglang:kv_cache_total_tokens` / `sglang:max_total_num_tokens` for SGLang —
+  see [SGLang backends](#sglang-backends)) cannot anchor **that
+  backend's** counter. This is
   **not fatal**: the poller logs an error, the counter stays unanchored (so
   that backend's autoconfig layer fails open), and the
   `gate_backend_capacity_unavailable{backend}` gauge is set to `1` for
@@ -397,7 +405,58 @@ identically — autoconfig is always on.
   the poller logs an error, sets the
   `gate_backend_capacity_unavailable{backend}` gauge, and keeps looping (see
   the [capacity-missing caveat](#capacity-missing-caveat-per-backend-fail-open)).
-  A merely unreachable vLLM is never fatal.
+  A merely unreachable backend is never fatal.
+
+### SGLang backends
+
+A `backends:` entry's `host`/`port` may point at a vLLM **or** an SGLang
+server — **no config change** is needed: the gate **auto-detects the engine
+from each backend's `/metrics` body** (fixed precedence, first match wins —
+by the usage gauge's *family-name presence*, not by sample values):
+`vllm:kv_cache_usage_perc` → **vLLM**; else `sglang:kv_cache_usage_perc` →
+**SGLang**; else `sglang:token_usage` → **SGLang**; else **unknown** (a 200
+body with no recognizable KV gauge, or an unparseable body). There is no
+config knob for the engine, and model discovery (`GET /v1/models`) is
+unchanged — SGLang's is OpenAI-schema.
+
+What the gate reads per engine (usage + capacity, new→legacy):
+
+| | vLLM | SGLang (newer) | SGLang (older / legacy) |
+|---|---|---|---|
+| usage fraction | `vllm:kv_cache_usage_perc` | `sglang:kv_cache_usage_perc` | `sglang:token_usage` |
+| capacity tokens | `vllm:kv_cache_size_tokens` (or the `kv_cache_size_tokens` label on `vllm:cache_config_info`) | `sglang:kv_cache_total_tokens` | `sglang:max_total_num_tokens` |
+| per-model label | `model_name` | `model_name` | `model_name` |
+
+When both a newer and a legacy SGLang gauge are present, the newer one is
+read.
+
+> **Legacy `token_usage` caveat.** SGLang's legacy `sglang:token_usage` is a
+> bottleneck across **all** token pools (`max(full, swa, mamba)`) and
+> **over-reports KV pressure on hybrid-SSM models**. The newer
+> `sglang:kv_cache_usage_perc` is KV-pools-only and is preferred — it is read
+> first whenever present.
+
+> **SGLang must be launched with `--enable-metrics`.** SGLang only serves
+> `/metrics` when started with `--enable-metrics`. Without it the backend
+> **fails open** (traffic is never blocked — the feed is simply stale) and
+> `gate_metrics_endpoint_unavailable{backend}` is set to `1`; the gate logs a
+> `--enable-metrics` warning **once per transition** into the unavailable
+> state (a purely unreachable server is a transport failure, not this — watch
+> `gate_metrics_fresh`).
+
+Two gauges surface the per-backend engine state (see
+[Metric reference](#metric-reference)):
+
+- `gate_backend_engine{backend,engine}` — `1` for the currently detected
+  engine (`engine` ∈ `vllm` \| `sglang` \| `unknown`), `0` for the other
+  engines; `unknown=1` is the initial state before the first detection.
+- `gate_metrics_endpoint_unavailable{backend}` — `0/1`; `1` while the
+  backend's `/metrics` is reachable-but-unrecognizable (non-200, or a 200
+  body with no recognizable KV gauge), `0` once a real engine is detected.
+
+The admission logic itself is engine-agnostic: both admission layers and the
+failover walk consume the same per-backend usage/capacity/remaining-KV state
+regardless of which engine produced it.
 
 ---
 
@@ -469,8 +528,8 @@ curl http://localhost:8000/healthz
 `metrics_age_s` — age of that backend's last successful metrics scrape,
 `kv_usage` — that backend's last cached usage **fraction**, `null` if never
 fetched, `kv_cache_capacity_tokens` — that backend's last cached KV-cache
-capacity, the `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens`
-label on `vllm:cache_config_info`, `null` if never observed, and
+capacity (the detected engine's capacity gauges — see
+[SGLang backends](#sglang-backends)), `null` if never observed, and
 `kv_cache_remaining_tokens` — that backend's autoconfig counter's current
 value, `null` if never anchored), plus `models` (the known model ids with
 `owned_by` — a scalar name when single-owner, a **list** of names when the
@@ -571,7 +630,7 @@ token_margin: 1.25
 
 | Key | Type | Default | Env override | Meaning |
 |---|---|---|---|---|
-| `backends` | list | *(required — no default)* | `BACKENDS_JSON` | **REQUIRED** list of vLLM backends. An empty/absent list fails with `at least one backend is required`. `BACKENDS_JSON` (a JSON list) **replaces** the file's `backends:` entirely (env wins). Model ids **may be duplicated** across backends (the normal multi-candidate case). See the [`backends` entry contract](#backends-entry-contract-required) below. |
+| `backends` | list | *(required — no default)* | `BACKENDS_JSON` | **REQUIRED** list of inference-engine backends (vLLM or SGLang — the engine is auto-detected, see [SGLang backends](#sglang-backends)). An empty/absent list fails with `at least one backend is required`. `BACKENDS_JSON` (a JSON list) **replaces** the file's `backends:` entirely (env wins). Model ids **may be duplicated** across backends (the normal multi-candidate case). See the [`backends` entry contract](#backends-entry-contract-required) below. |
 | `routing` | mapping | *(absent)* | — | **Optional, file-only** (no env override) per-model routing for model ids served by 2+ backends: `model → {policy, order[, threshold_tokens]}`. Omitted or `{}` is valid; every malformed entry is a `ConfigError`. A multi-owner model with no entry defaults to `round_robin` over its candidates in config order. See [Routing policies](#routing-policies-per-model) and the [`routing` entry contract](#routing-entry-contract-optional). |
 | `listen_host` | string | `0.0.0.0` | `LISTEN_HOST` | Bind address for the gate. |
 | `listen_port` | int | `8000` | `LISTEN_PORT` | Port the gate listens on. |
@@ -600,8 +659,8 @@ token_margin: 1.25
 | Field | Type | Constraint | Meaning |
 |---|---|---|---|
 | `name` | string | non-empty; **unique across backends** | Operator-chosen mnemonic (used in logs, `/healthz`, `/metrics` labels, the 429 message). |
-| `host` | string | non-empty | Hostname of the vLLM server (API + `/metrics` + `/v1/models`). |
-| `port` | int | `1 <= port <= 65535` | Port of the vLLM server. |
+| `host` | string | non-empty | Hostname of the inference-engine server — vLLM **or** SGLang (API + `/metrics` + `/v1/models`; the engine is auto-detected, see [SGLang backends](#sglang-backends)). |
+| `port` | int | `1 <= port <= 65535` | Port of the inference-engine server. |
 | `models` | list of strings | *(optional)*; **no duplicates within a backend**, but **duplicates across backends are legal** | The backend's owned model ids (mnemonic + validation anchor). **Omit (or leave empty) to auto-adopt** the served set from the backend's `GET /v1/models`. When present and non-empty it **wins** over discovery. A model id listed by 2+ backends is the normal multi-candidate case — the `routing:` section decides which backend gets a request. |
 | `default` | bool | *(optional, default `false`)*; **at most one `true` across backends** | The fallback backend for unknown/unparseable models. If none is flagged, the **first** entry is the default. |
 | `thresholds` | list | *(optional)*; same entry contract as the global `thresholds` | Per-backend tiered policy. `null`/omitted ⇒ the global `thresholds`. |
@@ -721,7 +780,7 @@ Content-Type: application/json
 
 {
   "error": {
-    "message": "backend qwen (model qwen3-32b): vLLM KV cache too full for a ~3800-token request (usage 84.0% >= 80% tier; max 1024). Retry in 30s.",
+    "message": "backend qwen (model qwen3-32b): KV cache too full for a ~3800-token request (usage 84.0% >= 80% tier; max 1024). Retry in 30s.",
     "type": "cache_pressure",
     "code": "kv_cache_too_full"
   }
@@ -737,7 +796,7 @@ Content-Type: application/json
 
 {
   "error": {
-    "message": "backend qwen (model qwen3-32b): vLLM KV cache headroom exhausted for a ~25000-token request (usage 50.0%, ~10000 of 100000 tokens remaining up to the 85% target). Retry in 21s.",
+    "message": "backend qwen (model qwen3-32b): KV cache headroom exhausted for a ~25000-token request (usage 50.0%, ~10000 of 100000 tokens remaining up to the 85% target). Retry in 21s.",
     "type": "cache_pressure",
     "code": "kv_cache_too_full"
   }
@@ -784,8 +843,9 @@ The gate exposes its own stats at `GET /metrics` — HTTP 200 with
 `Content-Type: text/plain; version=0.0.4; charset=utf-8`, body in the
 Prometheus text exposition format (the same shape vLLM emits). It is a
 gate-local endpoint like `/healthz`, **not proxied** — do not confuse the two:
-the per-backend pollers scrape **each vLLM backend's** `/metrics` (on the
-backend's port), while the gate's `GET /metrics` (on the gate's port) serves
+the per-backend pollers scrape **each backend's** `/metrics` (on the
+backend's port — vLLM or SGLang), while the gate's `GET /metrics` (on the gate's
+port) serves
 the gate's own `gate_*` metrics. They are different endpoints and different
 Prometheus scrape targets.
 
@@ -810,6 +870,8 @@ Prometheus scrape targets.
 | `gate_kv_cache_usage_pct` | Gauge | `model_name` (vLLM's `model_name` label; `default` when the series is unlabeled) | Current KV-cache fill **percentage (0–100)** per served model (vLLM's real metric, converted from the fraction). The gate **unions all backends' per-model breakdowns** on each render; a key can repeat for a model id served by 2+ backends or for the synthetic `default` label — the max on a repeated key wins (conservative). |
 | `gate_kv_cache_remaining_tokens` | Gauge | `backend` | The gate's **own live estimate** of remaining KV-cache tokens up to that backend's target (post-subtraction, pre-reanchor); `NaN` until the first anchor. Distinct from `gate_kv_cache_usage_pct` — this is the gate's estimate, not vLLM's real usage. |
 | `gate_backend_capacity_unavailable` | Gauge | `backend` | `1` if that backend's observed (HTTP 200) `/metrics` body lacks a usable KV-cache capacity (its autoconfig layer fails open — see the [capacity-missing caveat](#capacity-missing-caveat-per-backend-fail-open)), `0` otherwise. Alert on this. |
+| `gate_backend_engine` | Gauge | `backend`, `engine` (`vllm` \| `sglang` \| `unknown`) | The **currently detected inference engine** per backend: `1` for the detected engine, `0` for the other two engines (`unknown=1` is the initial state before the first detection — the gauge is always fully populated and scrape-able). The engine is auto-detected from the `/metrics` body; see [SGLang backends](#sglang-backends). |
+| `gate_metrics_endpoint_unavailable` | Gauge | `backend` | `1` while that backend's `/metrics` endpoint is reachable-but-unrecognizable (non-200, or a 200 body with no recognizable KV-cache gauge — e.g. SGLang launched without `--enable-metrics`), `0` once a real engine is detected. A purely unreachable server is *not* this (watch `gate_metrics_fresh`). Alert on this. |
 | `gate_config_info` | Info | one label per config field + `thresholds_json` + `backends_json` + `routing_json` | The loaded configuration, set once at startup. `backends_json` serializes the backend structure (per backend: `name`, `host`, `port`, `default`, and which knobs are overridden per-backend) but **not** the `models` lists (discovered data would go stale). `routing_json` serializes the `routing:` section as `[[model, policy, [order...]], ...]` (`[]` when absent — startup-static, for operator audit). |
 | `gate_metrics_fresh` | Gauge | `backend` | `1` if that backend's metrics feed is fresh, `0` if stale or never fetched. |
 | `gate_metrics_age_s` | Gauge | `backend` | Seconds since the last successful `/metrics` fetch for that backend; `NaN` if never fetched. |
@@ -844,6 +906,10 @@ gate_metrics_fresh
 gate_metrics_age_s
 # alert: which backend cannot anchor its counter (capacity missing)?
 gate_backend_capacity_unavailable == 1
+# per-backend detected engine (1 for the detected engine: vllm | sglang | unknown)
+gate_backend_engine
+# alert: which backend's /metrics is reachable but unrecognized (e.g. SGLang without --enable-metrics)?
+gate_metrics_endpoint_unavailable == 1
 # forwarded requests per model per backend
 sum by (model, backend) (rate(gate_requests_total{result="forwarded"}[5m]))
 # failover skips (why did requests bounce between candidates?)
@@ -876,11 +942,11 @@ scrape_configs:
   backend (it cannot measure headroom, so it does not block); the other
   backends are unaffected. Watch the warning logs and the per-backend
   `metrics_age_s` / `kv_usage` in `/healthz`.
-- **Capacity-missing is per-backend fail-open (not fatal).** A *live* vLLM
-  backend whose `/metrics` body lacks a usable KV-cache capacity (the
-  `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
-  `vllm:cache_config_info`) cannot anchor **that backend's** remaining-KV
-  counter: the gate logs an error, that backend's autoconfig layer fails open,
+- **Capacity-missing is per-backend fail-open (not fatal).** A *live* backend
+  whose `/metrics` body lacks a usable KV-cache capacity (the detected
+  engine's capacity gauges — see [SGLang backends](#sglang-backends)) cannot
+  anchor **that backend's** remaining-KV counter: the gate logs an error, that
+  backend's autoconfig layer fails open,
   and the `gate_backend_capacity_unavailable{backend}` gauge is set to `1`.
   The process does **not** exit and the other backends keep gating normally.
   An unreachable or stale feed is likewise never fatal — that path fails open.
@@ -925,9 +991,14 @@ scrape_configs:
 
 ## Limitations & v2 roadmap
 
+- **Engines are detected, not configured.** vLLM and SGLang are supported
+  today (see [SGLang backends](#sglang-backends)); further
+  OpenAI-compatible engines are additive via the parser interface (`detect_engine`
+  + a `MetricsParser` implementation).
 - **Policy is per backend, not per model.** Admission state and policy
   (thresholds, the four autoconfig knobs) are scoped per backend: models on
-  one backend share its KV pool (single-engine vLLM) and are treated the same.
+  one backend share its KV pool (one inference engine) and are treated the
+  same.
   Per-model *thresholds* (an independent admission policy per model on a
   shared-KV backend) are not supported. Routing *by* model **is** implemented
   (the per-model `routing:` policies in

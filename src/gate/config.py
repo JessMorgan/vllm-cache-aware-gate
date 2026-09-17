@@ -102,7 +102,13 @@ class Threshold:
 
 @dataclass(frozen=True)
 class Backend:
-    """One configured vLLM backend (multi-backend routing, design plan §2.1).
+    """One configured inference-engine backend (multi-backend routing, design plan §2.1).
+
+    ``host``/``port`` may point at a vLLM *or* an SGLang server — the engine
+    is auto-detected from the backend's ``/metrics`` body (there is no engine
+    config knob; docs/plans/sglang-backend.md decision 1). SGLang must be
+    launched with ``--enable-metrics`` or its backend fails open (surfaced by
+    the ``gate_metrics_endpoint_unavailable`` gauge).
 
     ``models`` is an optional mnemonic + validation anchor; an empty tuple
     means the owned model set is auto-adopted from the backend's
