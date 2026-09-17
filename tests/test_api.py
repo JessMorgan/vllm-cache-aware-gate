@@ -1766,6 +1766,96 @@ def test_shared_failover_last_candidate_streaming_5xx_propagates_verbatim() -> N
     )
 
 
+def test_shared_failover_429_exhaustion_releases_last_streaming_5xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidate 0 429s (driven high) and the LAST candidate (candidate 1)
+    returns a STREAMING pre-stream 5xx. The 429-exhaustion check runs before
+    last-5xx propagation, so the 429 wins (the gate's capacity decision is more
+    actionable than a raw 5xx) and the last candidate's streaming 5xx is
+    discarded — its upstream connection must be released (the proxy's
+    _stream() generator primed then closed), not leaked back to the pool. This
+    pins the regression where the 429 path dropped the last candidate's
+    StreamingResponse without closing it. The upstream ``aclose()`` is spied on
+    so the release is asserted DIRECTLY (not just that the path runs without
+    error): the 500 upstream response must be closed."""
+    from gate.routing import RoutingSpec
+
+    # Spy on httpx.Response.aclose to directly observe the upstream connection
+    # release. The proxy's _stream() generator finally calls upstream.aclose();
+    # a discarded streaming 5xx (status 500) is released by the 429-exhaustion
+    # path, so aclose must be called on the 500 response.
+    aclose_calls: list[int] = []
+    real_aclose = httpx.Response.aclose
+
+    async def spy_aclose(self: httpx.Response) -> None:
+        aclose_calls.append(self.status_code)
+        await real_aclose(self)
+
+    monkeypatch.setattr(httpx.Response, "aclose", spy_aclose)
+
+    fakes, order = _shared_fakes(usage_a=0.90, usage_b=0.10)
+    fakes["b"].completions_status = 500  # candidate 1 (last): streaming 500
+    cfg = shared_multi_config(
+        (
+            RoutingEntry(
+                model="m", spec=RoutingSpec(policy="primary_fallback", order=("qwen", "llama"))
+            ),
+        )
+    )
+    cache_a = MetricsCache()
+    cache_a.update(0.90)
+    cache_b = MetricsCache()
+    cache_b.update(0.10)
+    counter_a = KvRemaining()
+    counter_a.reanchor(100)
+    counter_b = KvRemaining()
+    counter_b.reanchor(5000)
+    with _build_shared(
+        cfg,
+        fakes,
+        cache_a=cache_a,
+        cache_b=cache_b,
+        counter_a=counter_a,
+        counter_b=counter_b,
+    ) as client:
+        # A large prompt: at 90% usage candidate 0's 80-tier governs
+        # (max_context 1024) and the ~1506-token ctx exceeds it -> reject;
+        # candidate 1 (10% usage) would admit, but it answers the stream with
+        # a 500 (a pre-stream 5xx on the LAST candidate).
+        resp = client.post(
+            "/v1/chat/completions", content=_shared_body(5000, stream=True), headers=JSON_HEADERS
+        )
+        metrics_body = client.get("/metrics").text
+    # The 429 wins over the last candidate's streaming 5xx (precedence).
+    assert resp.status_code == 429
+    # Combined reject on qwen: tiered (80-tier, 30s) AND autoconfig (counter
+    # 100 << effective ~1883 -> scaled to retry_max 60s); the max is 60.
+    assert resp.headers["Retry-After"] == "60"
+    assert resp.json()["error"]["type"] == "cache_pressure"
+    # Candidate 0 rejected at admission (never proxied) and candidate 1 was
+    # proxied (the streaming 500) — the walk advanced past the reject to the
+    # last candidate. `order` records proxied generation requests only.
+    assert order == ["b"]
+    # The reject is recorded with the max-timeout rejector (qwen), not "none".
+    assert (
+        'gate_requests_total{backend="qwen",endpoint="chat_completions",model="m",'
+        'result="rejected"} 1.0' in metrics_body
+    )
+    # The skip from A (reject) to B was counted.
+    assert (
+        'gate_routing_failovers_total{from="qwen",model="m",reason="reject",to="llama"} 1.0'
+        in metrics_body
+    )
+    # The last candidate's discarded streaming 5xx (status 500) had its
+    # upstream connection RELEASED — the proxy's _stream() generator finally
+    # ran upstream.aclose() on the 500 response. This is the direct
+    # observation of the leak fix (a regression that dropped the
+    # StreamingResponse without closing it would leave aclose_calls empty).
+    # == [500] pins the release happened EXACTLY once (no double-close).
+    assert aclose_calls == [500]
+
+
 def test_shared_failover_skip_on_reject() -> None:
     """Candidate 0 429s (driven high) -> candidate 1 forwards (skip-on-reject)."""
     from gate.routing import RoutingSpec

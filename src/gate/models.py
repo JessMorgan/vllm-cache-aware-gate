@@ -20,11 +20,13 @@ Invariants (see docs/plans/multi-backend.md §2.2):
   backends is the normal multi-candidate case, not a collision.
   :meth:`ModelRegistry.resolve_candidates` is the v2 routing lookup used by
   the failover walk — it returns ALL owners in registration (config) order.
-- :meth:`ModelRegistry.resolve` is retained (the current app path) and
-  returns the collision winner (the ``default: true`` backend if any
-  owner is the default, else the first-registered owner) for multi-owner
-  models; the conflict is logged once per (model, backend) pair, not on
-  every repeated sync.
+- :meth:`ModelRegistry.resolve` is retained (the app uses
+  :meth:`resolve_candidates` for routing and for the ``owned_by`` scalar/list
+  form; ``resolve`` is exercised by the test suite) and returns the
+  collision winner (the ``default: true`` backend if any owner is the
+  default, else the first-registered owner) for multi-owner models; the
+  conflict is logged once per (model, backend) pair, not on every repeated
+  sync.
 - A model no longer owned by any backend stops resolving (``None`` / empty
   tuple); requests for it take the unknown-model path (default backend),
   never a hard 404.
@@ -129,7 +131,8 @@ class ModelRegistry:
     def resolve(self, model: str) -> str | None:
         """Resolve a model id to a backend name; ``None`` when unowned.
 
-        Retained as the current app path. For a model owned by 2+
+        Retained for the test suite (the app uses :meth:`resolve_candidates`
+        for routing and the ``owned_by`` form). For a model owned by 2+
         backends (legal — decision 11) returns the collision winner
         (default-wins); use :meth:`resolve_candidates` for the full
         candidate set.

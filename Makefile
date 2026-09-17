@@ -33,7 +33,7 @@ build:
 	docker build -t vllm-gate .
 
 run-local:
-	$(VENV)/bin/uvicorn gate.app:app --host 0.0.0.0 --port 8000
+	$(VENV)/bin/python -m gate.main
 
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov dist build *.egg-info src/*.egg-info

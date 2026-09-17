@@ -183,6 +183,12 @@ gate attempts the selected candidate first and walks the rest in order.
   backend (the gate's decision was "forward"; the 5xx is the upstream's
   answer, not the gate's rejection).
 
+  **Precedence:** the 429-exhaustion check runs *before* last-5xx
+  propagation, so if an earlier candidate 429'd **and** the last candidate
+  returned a pre-stream 5xx, the **429 wins** (the gate's capacity decision is
+  more actionable than a raw 5xx) and the 5xx is *not* propagated — last-5xx
+  propagation applies only when *no* candidate 429'd.
+
 ### Decision logic (per request, per candidate)
 
 Every request is then evaluated by **two admission layers, AND-combined, on the
@@ -342,12 +348,14 @@ Capacity 100 000, target 85%, margin 1.25, retry 5/60.
   `sglang:kv_cache_total_tokens` / `sglang:max_total_num_tokens` for SGLang —
   see [SGLang backends](#sglang-backends)) cannot anchor **that
   backend's** counter. This is
-  **not fatal**: the poller logs an error, the counter stays unanchored (so
-  that backend's autoconfig layer fails open), and the
-  `gate_backend_capacity_unavailable{backend}` gauge is set to `1` for
-  alerting. The poller keeps looping and **all other backends are unaffected**
-  — killing the whole proxy because one backend is misconfigured would take
-  down the healthy ones. Alert on the gauge rather than expecting a crash.
+   **not fatal**: the poller logs an error, the counter stays unanchored (so
+   that backend's autoconfig layer fails open), and the
+   `gate_backend_capacity_unavailable{backend}` gauge is set to `1` for
+   alerting. The gauge is **state-driven**: it returns to `0` when a later
+   `/metrics` body provides capacity again (it is not a sticky one-way
+   ratchet). The poller keeps looping and **all other backends are unaffected**
+   — killing the whole proxy because one backend is misconfigured would take
+   down the healthy ones. Alert on the gauge rather than expecting a crash.
 - **An unreachable or stale feed is never fatal** — the gate **fails open**
   (forwards) and keeps retrying. A metrics outage never blocks traffic
   (invariant #1).
@@ -769,7 +777,9 @@ unaffected.
 > - **Every candidate transport-failed** (no HTTP answer) → **502** (never
 >   200/429).
 > - **A pre-stream 5xx on the last candidate** is **propagated as-is**
->   (unmasked) and recorded as forwarded with that backend.
+>   (unmasked) and recorded as forwarded with that backend — but only when
+>   *no* candidate 429'd (the 429-exhaustion check runs first, so an earlier
+>   429 supersedes a last-candidate 5xx).
 
 **Tiered rejector** (the tiered layer is the reported rejector):
 

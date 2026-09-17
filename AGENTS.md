@@ -165,9 +165,12 @@ FastAPI app wires together.
   `sglang:kv_cache_total_tokens` / `sglang:max_total_num_tokens` for SGLang;
   "no recognizable KV-cache capacity" for `unknown` — `_capacity_gauge_names`
   makes the error message **engine-aware**) logs an error,
-  leaves that backend's counter unanchored (its autoconfig layer fails open),
-  and invokes the `capacity_unavailable` callback (surfaced by the
-  `gate_backend_capacity_unavailable{backend}` gauge); the loop keeps running.
+   leaves that backend's counter unanchored (its autoconfig layer fails open),
+   and invokes the `capacity_unavailable(state)` callback **on a state change
+   (either direction)** — `True` on the transition into capacity-missing,
+   `False` on recovery — so the app's `capacity_unavailable` flag (surfaced
+   by the `gate_backend_capacity_unavailable{backend}` gauge) is set and
+   cleared, not a sticky ratchet; the loop keeps running.
   Also does **model discovery** when `model_url`/`registry`/`backend_name`
   are wired (first tick immediately, then every `model_refresh_s`): `fetch_models`
   (a `GET /v1/models` + `parse_v1_models`) and `registry.sync(backend_name,
@@ -843,8 +846,12 @@ proxy, not an inference engine.
     `vllm:kv_cache_size_tokens` gauge or the `kv_cache_size_tokens` label on
     `vllm:cache_config_info`) cannot anchor its counter: the poller logs an
     error, leaves **that backend's** counter unanchored (its autoconfig layer
-    fails open), flips its `capacity_unavailable` flag (surfaced by the
-    `gate_backend_capacity_unavailable{backend}` gauge, set to 1), and keeps
+    fails open), and sets its `capacity_unavailable` flag (surfaced by the
+    `gate_backend_capacity_unavailable{backend}` gauge, set to 1) — the flag
+    is **state-change driven** (the poller's `capacity_unavailable` callback
+    fires with the new state, either direction), so it is **cleared back to 0
+    on recovery** when a later observed body provides capacity again (not a
+    sticky one-way ratchet), and keeps
     looping — the process does **not** exit (the old
     `CapacityUnavailableError`/exit-1 behavior is gone; killing the whole
     proxy because one backend is misconfigured would take down the healthy
@@ -985,7 +992,11 @@ proxy, not an inference engine.
     `backend="none"`). A pre-stream 5xx on the **last** candidate is
     **propagated as-is** (status AND body unmasked — gotcha #6; the
     single-backend case is exactly this) and recorded as **forwarded** with
-    that backend. `fill` and `primary_fallback` **reach the same surviving
+    that backend. **Precedence:** the 429-exhaustion check runs *before* the
+    last-5xx propagation, so if an earlier candidate 429'd **and** the last
+    candidate returned a pre-stream 5xx, the **429 wins** (the gate's capacity
+    decision is more actionable than a raw 5xx) and the 5xx is *not*
+    propagated — last-5xx propagation applies only when *no* candidate 429'd. `fill` and `primary_fallback` **reach the same surviving
     candidate for every request** (both run the same walk; `fill`'s prefilter
     is the exact `decision_auto` admission test, so it can disagree with the
     walk on no candidate): they differ only in selection cost and in one
