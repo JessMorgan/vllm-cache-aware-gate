@@ -985,7 +985,11 @@ proxy, not an inference engine.
     `backend="none"`). A pre-stream 5xx on the **last** candidate is
     **propagated as-is** (status AND body unmasked — gotcha #6; the
     single-backend case is exactly this) and recorded as **forwarded** with
-    that backend. `fill` and `primary_fallback` **reach the same surviving
+    that backend. **Precedence:** the 429-exhaustion check runs *before* the
+    last-5xx propagation, so if an earlier candidate 429'd **and** the last
+    candidate returned a pre-stream 5xx, the **429 wins** (the gate's capacity
+    decision is more actionable than a raw 5xx) and the 5xx is *not*
+    propagated — last-5xx propagation applies only when *no* candidate 429'd. `fill` and `primary_fallback` **reach the same surviving
     candidate for every request** (both run the same walk; `fill`'s prefilter
     is the exact `decision_auto` admission test, so it can disagree with the
     walk on no candidate): they differ only in selection cost and in one

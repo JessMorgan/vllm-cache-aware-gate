@@ -183,6 +183,12 @@ gate attempts the selected candidate first and walks the rest in order.
   backend (the gate's decision was "forward"; the 5xx is the upstream's
   answer, not the gate's rejection).
 
+  **Precedence:** the 429-exhaustion check runs *before* last-5xx
+  propagation, so if an earlier candidate 429'd **and** the last candidate
+  returned a pre-stream 5xx, the **429 wins** (the gate's capacity decision is
+  more actionable than a raw 5xx) and the 5xx is *not* propagated — last-5xx
+  propagation applies only when *no* candidate 429'd.
+
 ### Decision logic (per request, per candidate)
 
 Every request is then evaluated by **two admission layers, AND-combined, on the
@@ -769,7 +775,9 @@ unaffected.
 > - **Every candidate transport-failed** (no HTTP answer) → **502** (never
 >   200/429).
 > - **A pre-stream 5xx on the last candidate** is **propagated as-is**
->   (unmasked) and recorded as forwarded with that backend.
+>   (unmasked) and recorded as forwarded with that backend — but only when
+>   *no* candidate 429'd (the 429-exhaustion check runs first, so an earlier
+>   429 supersedes a last-candidate 5xx).
 
 **Tiered rejector** (the tiered layer is the reported rejector):
 
