@@ -264,6 +264,32 @@ def _on_reanchor_setter(bs: BackendState) -> Callable[[], None]:
     return _bump
 
 
+async def _release_streaming_response(resp: Response) -> None:
+    """Release the upstream connection behind a discarded streaming response.
+
+    Used when a pre-stream upstream 5xx is *discarded* (skipped) rather than
+    propagated — either to walk to the next candidate or because the
+    429-exhaustion path returns the 429 instead. The proxy's ``_stream()`` is
+    an async generator whose ``finally`` closes the upstream response;
+    ``aclose()`` on an UNSTARTED async generator is a no-op (it does not run
+    the finally), so prime the generator first (start it, reading the first
+    chunk of the discarded body) and then close it — that runs the finally and
+    releases the upstream connection back to the shared httpx pool. A
+    non-streaming response needs nothing (its body is already buffered and the
+    connection is not held open). starlette types ``body_iterator`` as a bare
+    AsyncIterable, so cast to the generator type to reach ``__anext__`` /
+    ``aclose``.
+    """
+    if not isinstance(resp, StreamingResponse):
+        return
+    iterator = cast(AsyncGenerator[bytes, None], resp.body_iterator)
+    try:
+        await iterator.__anext__()
+    except StopAsyncIteration:
+        pass  # empty body: exhaustion already ran the finally
+    await iterator.aclose()
+
+
 def _on_engine_setter(bs: BackendState) -> Callable[[str], None]:
     """A callback that records one backend's detected engine.
 
@@ -706,23 +732,10 @@ def create_app(
                     bs.counter.add(charge)
                 if next_name is not None:
                     # Discarding the 5xx body to skip to the next candidate:
-                    # release the upstream connection now. The proxy's
-                    # _stream() is an async generator whose finally closes the
-                    # upstream response. aclose() on an UNSTARTED async
-                    # generator is a no-op (it does not run the finally), so
-                    # prime the generator first (start it, reading the first
-                    # chunk of the discarded 5xx body) and then close it —
-                    # that runs the finally and releases the upstream connection
-                    # back to the shared httpx pool. starlette types
-                    # body_iterator as a bare AsyncIterable, so cast to the
-                    # generator type to reach __anext__ / aclose.
-                    if isinstance(resp, StreamingResponse):
-                        iterator = cast(AsyncGenerator[bytes, None], resp.body_iterator)
-                        try:
-                            await iterator.__anext__()
-                        except StopAsyncIteration:
-                            pass  # empty body: exhaustion already ran the finally
-                        await iterator.aclose()
+                    # release the upstream connection now (the proxy's
+                    # _stream() finally closes it; prime-then-close so the
+                    # finally runs even on an unstarted generator).
+                    await _release_streaming_response(resp)
                     _record_failover(model, name, next_name, "upstream_5xx")
                     log.info(
                         "routing_failover model=%s from=%s to=%s reason=upstream_5xx",
@@ -782,6 +795,15 @@ def create_app(
                 stats.record_rejected(endpoint, model, ctx_tokens, backend=rejector_name)
             except Exception:  # noqa: BLE001 - stats must never break the request path
                 log.warning("stats.record_rejected failed", exc_info=True)
+            # The 429-exhaustion check runs before last-5xx propagation, so a
+            # last-candidate pre-stream 5xx (remembered in last_upstream_5xx)
+            # is NOT propagated here — it is discarded. If it was a streaming
+            # response, release its upstream connection now (the proxy's
+            # _stream() finally closes it; prime-then-close so the finally runs
+            # even on an unstarted generator) instead of leaking it back to the
+            # pool.
+            if last_upstream_5xx is not None:
+                await _release_streaming_response(last_upstream_5xx[0])
             return JSONResponse(
                 status_code=429,
                 headers={"Retry-After": str(max_retry)},
